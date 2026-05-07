@@ -1,0 +1,738 @@
+// ============================================
+// AIGC 平台 Prisma Schema
+// 版本: 1.0.0
+// 数据库: MySQL 8+
+// ============================================
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// 用户与认证
+// ============================================
+
+model User {
+  id                      String    @id @default(cuid())
+  account                 String    @unique
+  email                   String?
+  phone                   String?   @unique
+  username                String
+  password_hash           String?
+  avatar_url              String?
+  role                    Role      @default(member)
+  status                  UserStatus @default(active)
+  plan_tier               PlanTier  @default(free)
+  password_change_required Boolean   @default(false)
+  generation_defaults     Json?
+  created_at              DateTime  @default(now()) @map("created_at")
+  updated_at              DateTime  @updatedAt @map("updated_at")
+
+  // 关联
+  refreshTokens     RefreshToken[]
+  emailVerifications EmailVerification[]
+  teamMemberships   TeamMember[]
+  ownedTeams         Team[]           @relation("TeamOwner")
+  creditAccount      CreditAccount?
+  taskBatches       TaskBatch[]
+  tasks              Task[]
+  assets             Asset[]
+  workspaces         Workspace[]
+  canvasNodeOutputs  CanvasNodeOutput[]
+  voiceProfiles      VoiceProfile[]
+  promptFilterLogs   PromptFilterLog[]
+  paymentOrders      PaymentOrder[]
+  aiAssistantErrors  AiAssistantError[]
+  submissionErrors   SubmissionError[]
+  workspaceMembers   WorkspaceMember[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id         String    @id @default(cuid())
+  user_id    String    @map("user_id")
+  token_hash String    @map("token_hash")
+  expires_at DateTime  @map("expires_at")
+  revoked_at DateTime? @map("revoked_at")
+  created_at DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@map("refresh_tokens")
+}
+
+model EmailVerification {
+  id         String   @id @default(cuid())
+  user_id    String   @map("user_id")
+  token_hash String   @map("token_hash")
+  type       EmailVerificationType @default(verify_email)
+  expires_at DateTime @map("expires_at")
+  used_at    DateTime? @map("used_at")
+  created_at DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@map("email_verifications")
+}
+
+// ============================================
+// 订阅与套餐
+// ============================================
+
+model SubscriptionPlan {
+  id             String   @id @default(cuid())
+  name           String
+  tier           PlanTier
+  price_monthly  String?  @map("price_monthly")
+  price_yearly   String?  @map("price_yearly")
+  credits_monthly Int      @default(0) @map("credits_monthly")
+  max_concurrency Int      @default(1) @map("max_concurrency")
+  max_batch_size Int      @default(1) @map("max_batch_size")
+  features       Json?
+  is_active       Boolean  @default(true) @map("is_active")
+  created_at     DateTime @default(now()) @map("created_at")
+
+  userSubscriptions UserSubscription[]
+  teamSubscriptions TeamSubscription[]
+
+  @@map("subscription_plans")
+}
+
+model UserSubscription {
+  id         String           @id @default(cuid())
+  user_id    String           @map("user_id")
+  plan_id    String           @map("plan_id")
+  status     SubscriptionStatus @default(active)
+  started_at DateTime         @default(now()) @map("started_at")
+  expires_at DateTime         @map("expires_at")
+  created_at DateTime         @default(now()) @map("created_at")
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  plan SubscriptionPlan @relation(fields: [plan_id], references: [id])
+
+  @@index([user_id])
+  @@map("user_subscriptions")
+}
+
+model TeamSubscription {
+  id         String           @id @default(cuid())
+  team_id    String           @map("team_id")
+  plan_id    String           @map("plan_id")
+  status     SubscriptionStatus @default(active)
+  started_at DateTime         @default(now()) @map("started_at")
+  expires_at DateTime         @map("expires_at")
+  created_at DateTime         @default(now()) @map("created_at")
+
+  team Team @relation(fields: [team_id], references: [id], onDelete: Cascade)
+  plan SubscriptionPlan @relation(fields: [plan_id], references: [id])
+
+  @@index([team_id])
+  @@map("team_subscriptions")
+}
+
+// ============================================
+// 团队与工作空间
+// ============================================
+
+model Team {
+  id               String     @id @default(cuid())
+  name             String
+  owner_id         String     @map("owner_id")
+  plan_tier        PlanTier   @default(free)
+  team_type        TeamType   @default(standard)
+  allow_member_topup Boolean  @default(true) @map("allow_member_topup")
+  is_deleted       Boolean    @default(false) @map("is_deleted")
+  deleted_at       DateTime?  @map("deleted_at")
+  created_at       DateTime   @default(now()) @map("created_at")
+  updated_at       DateTime   @updatedAt @map("updated_at")
+
+  // 关联
+  owner         User              @relation("TeamOwner", fields: [owner_id], references: [id])
+  members       TeamMember[]
+  subscriptions TeamSubscription[]
+  workspaces    Workspace[]
+  creditAccount CreditAccount?
+  taskBatches   TaskBatch[]
+  paymentOrders PaymentOrder[]
+
+  @@map("teams")
+}
+
+model TeamMember {
+  team_id       String      @map("team_id")
+  user_id       String      @map("user_id")
+  role          TeamRole    @default(editor)
+  joined_at     DateTime    @default(now()) @map("joined_at")
+  credit_quota  Int?        @map("credit_quota")
+  credit_used   Int         @default(0) @map("credit_used")
+  quota_period  QuotaPeriod?
+  quota_reset_at DateTime?  @map("quota_reset_at")
+  priority_boost Boolean    @default(false) @map("priority_boost")
+
+  team Team @relation(fields: [team_id], references: [id], onDelete: Cascade)
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@id([team_id, user_id])
+  @@index([user_id])
+  @@map("team_members")
+}
+
+model Workspace {
+  id          String    @id @default(cuid())
+  team_id     String?   @map("team_id")
+  name        String
+  description String?
+  created_by  String    @map("created_by")
+  is_deleted  Boolean   @default(false) @map("is_deleted")
+  deleted_at  DateTime? @map("deleted_at")
+  created_at  DateTime  @default(now()) @map("created_at")
+
+  team      Team?           @relation(fields: [team_id], references: [id], onDelete: SetNull)
+  creator   User            @relation(fields: [created_by], references: [id])
+  members   WorkspaceMember[]
+  canvases   Canvas[]
+  videoProjects VideoStudioProject[]
+  quotas     QuotaPeriod[]
+
+  @@index([team_id])
+  @@index([created_by])
+  @@map("workspaces")
+}
+
+model WorkspaceMember {
+  id           String          @id @default(cuid())
+  workspace_id String          @map("workspace_id")
+  user_id      String          @map("user_id")
+  role         WorkspaceRole   @default(viewer)
+  created_at   DateTime        @default(now()) @map("created_at")
+
+  workspace Workspace @relation(fields: [workspace_id], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([workspace_id, user_id])
+  @@index([user_id])
+  @@map("workspace_members")
+}
+
+// ============================================
+// 积分系统
+// ============================================
+
+model CreditAccount {
+  id            String   @id @default(cuid())
+  owner_type    OwnerType @default(user)
+  user_id       String?  @unique @map("user_id")
+  team_id       String?  @unique @map("team_id")
+  balance       Int      @default(0)
+  frozen_credits Int     @default(0) @map("frozen_credits")
+  total_earned  Int      @default(0) @map("total_earned")
+  total_spent   Int      @default(0) @map("total_spent")
+  updated_at    DateTime @updatedAt @map("updated_at")
+
+  user    User?     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  team    Team?     @relation(fields: [team_id], references: [id], onDelete: Cascade)
+  ledger  CreditsLedger[]
+  taskBatches TaskBatch[]
+
+  @@map("credit_accounts")
+}
+
+model CreditsLedger {
+  id              String       @id @default(cuid())
+  credit_account_id String     @map("credit_account_id")
+  user_id         String       @map("user_id")
+  amount          Int
+  type            LedgerType
+  task_id         String?      @map("task_id")
+  batch_id        String?      @map("batch_id")
+  description     String?
+  created_at      DateTime     @default(now()) @map("created_at")
+
+  creditAccount CreditAccount @relation(fields: [credit_account_id], references: [id], onDelete: Cascade)
+
+  @@index([credit_account_id])
+  @@index([user_id, createdAt])
+  @@map("credits_ledger")
+}
+
+// ============================================
+// 任务与批次
+// ============================================
+
+model TaskBatch {
+  id                 String          @id @default(cuid())
+  user_id            String          @map("user_id")
+  team_id            String?         @map("team_id")
+  workspace_id       String?         @map("workspace_id")
+  credit_account_id  String?         @map("credit_account_id")
+  parent_batch_id    String?         @map("parent_batch_id")
+  idempotency_key    String          @unique @map("idempotency_key")
+  module             TaskModule
+  provider           String
+  model              String
+  prompt             String
+  params             Json
+  quantity           Int             @default(1) @map("quantity")
+  completed_count    Int             @default(0) @map("completed_count")
+  failed_count       Int             @default(0) @map("failed_count")
+  status             BatchStatus     @default(pending)
+  estimated_credits  Int             @map("estimated_credits")
+  actual_credits     Int             @default(0) @map("actual_credits")
+  is_hidden          Boolean         @default(false) @map("is_hidden")
+  is_deleted         Boolean         @default(false) @map("is_deleted")
+  deleted_at         DateTime?       @map("deleted_at")
+  canvas_id          String?         @map("canvas_id")
+  canvas_node_id     String?         @map("canvas_node_id")
+  video_studio_project_id String?    @map("video_studio_project_id")
+  created_at         DateTime        @default(now()) @map("created_at")
+  updated_at         DateTime        @updatedAt @map("updated_at")
+
+  user           User           @relation(fields: [user_id], references: [id])
+  team           Team?          @relation(fields: [team_id], references: [id])
+  creditAccount  CreditAccount? @relation(fields: [credit_account_id], references: [id])
+  tasks          Task[]
+  assets         Asset[]
+
+  @@index([user_id])
+  @@index([team_id])
+  @@index([status, createdAt])
+  @@map("task_batches")
+}
+
+model Task {
+  id                String      @id @default(cuid())
+  batch_id          String      @map("batch_id")
+  user_id           String      @map("user_id")
+  version_index     Int         @default(0) @map("version_index")
+  queue_job_id      String?     @map("queue_job_id")
+  external_task_id  String?     @map("external_task_id")
+  status            TaskStatus  @default(pending)
+  retry_count       Int         @default(0) @map("retry_count")
+  estimated_credits Int         @map("estimated_credits")
+  credits_cost      Int?        @map("credits_cost")
+  provider_cost_raw Json?       @map("provider_cost_raw")
+  processing_started_at DateTime? @map("processing_started_at")
+  completed_at       DateTime?   @map("completed_at")
+  error_message     String?     @map("error_message")
+
+  batch  TaskBatch @relation(fields: [batch_id], references: [id], onDelete: Cascade)
+  user   User      @relation(fields: [user_id], references: [id])
+  assets Asset[]
+
+  @@index([batch_id])
+  @@index([user_id])
+  @@index([status, createdAt])
+  @@map("tasks")
+}
+
+// ============================================
+// 资产
+// ============================================
+
+model Asset {
+  id              String       @id @default(cuid())
+  task_id         String       @map("task_id")
+  batch_id        String       @map("batch_id")
+  user_id         String       @map("user_id")
+  type            AssetType
+  storage_url     String?      @map("storage_url")
+  original_url    String?      @map("original_url")
+  thumbnail_url   String?      @map("thumbnail_url")
+  transfer_status TransferStatus @default(pending) @map("transfer_status")
+  file_size       Int?         @map("file_size")
+  duration        Int?         // 毫秒
+  width           Int?
+  height          Int?
+  metadata        Json?
+  is_deleted      Boolean      @default(false) @map("is_deleted")
+  deleted_at      DateTime?    @map("deleted_at")
+  created_at      DateTime     @default(now()) @map("created_at")
+
+  task   Task     @relation(fields: [task_id], references: [id], onDelete: Cascade)
+  batch  TaskBatch @relation(fields: [batch_id], references: [id])
+  user   User     @relation(fields: [user_id], references: [id])
+
+  @@index([task_id])
+  @@index([batch_id])
+  @@index([user_id])
+  @@map("assets")
+}
+
+// ============================================
+// 画布
+// ============================================
+
+model Canvas {
+  id            String    @id @default(cuid())
+  workspace_id  String    @map("workspace_id")
+  user_id       String    @map("user_id")
+  name          String
+  thumbnail_url String?   @map("thumbnail_url")
+  structure_data Json     @map("structure_data")
+  version       Int       @default(1)
+  is_deleted    Boolean   @default(false) @map("is_deleted")
+  deleted_at    DateTime? @map("deleted_at")
+  created_at    DateTime  @default(now()) @map("created_at")
+  updated_at    DateTime  @updatedAt @map("updated_at")
+
+  workspace Workspace          @relation(fields: [workspace_id], references: [id])
+  creator   User               @relation(fields: [user_id], references: [id])
+  nodeOutputs CanvasNodeOutput[]
+
+  @@index([workspace_id])
+  @@index([user_id])
+  @@map("canvases")
+}
+
+model CanvasNodeOutput {
+  id              String   @id @default(cuid())
+  canvas_id       String   @map("canvas_id")
+  node_id         String   @map("node_id")
+  user_id         String   @map("user_id")
+  batch_id        String?  @map("batch_id")
+  output_urls     Json     @map("output_urls")
+  params_snapshot Json?   @map("params_snapshot")
+  is_selected     Boolean  @default(false) @map("is_selected")
+  created_at      DateTime @default(now()) @map("created_at")
+
+  canvas Canvas @relation(fields: [canvas_id], references: [id], onDelete: Cascade)
+  creator User   @relation(fields: [user_id], references: [id])
+
+  @@index([canvas_id])
+  @@map("canvas_node_outputs")
+}
+
+// ============================================
+// 视频工作室
+// ============================================
+
+model VideoStudioProject {
+  id           String    @id @default(cuid())
+  workspace_id String    @map("workspace_id")
+  user_id      String    @map("user_id")
+  name         String
+  wizard_state Json      @map("wizard_state")
+  is_deleted   Boolean   @default(false) @map("is_deleted")
+  deleted_at   DateTime? @map("deleted_at")
+  created_at   DateTime  @default(now()) @map("created_at")
+  updated_at   DateTime  @updatedAt @map("updated_at")
+
+  workspace Workspace @relation(fields: [workspace_id], references: [id])
+  creator   User      @relation(fields: [user_id], references: [id])
+
+  @@index([workspace_id])
+  @@index([user_id])
+  @@map("video_studio_projects")
+}
+
+// ============================================
+// AI 提供商配置
+// ============================================
+
+model Provider {
+  id       String   @id @default(cuid())
+  code     String   @unique
+  name     String
+  region   ProviderRegion @default(cn)
+  modules  Json     @map("modules")
+  is_active Boolean  @default(true) @map("is_active")
+  config   Json
+  created_at DateTime @default(now()) @map("created_at")
+
+  models ProviderModel[]
+
+  @@map("providers")
+}
+
+model ProviderModel {
+  id              String     @id @default(cuid())
+  provider_id     String     @map("provider_id")
+  code            String
+  name            String
+  module          TaskModule
+  credit_cost     Int         @map("credit_cost")
+  params_pricing  Json        @map("params_pricing")
+  params_schema   Json        @map("params_schema")
+  is_active       Boolean    @default(true) @map("is_active")
+
+  provider Provider @relation(fields: [provider_id], references: [id], onDelete: Cascade)
+
+  @@unique([provider_id, code])
+  @@map("provider_models")
+}
+
+model VoiceProfile {
+  id               String         @id @default(cuid())
+  user_id          String         @map("user_id")
+  name             String
+  provider         String
+  external_voice_id String         @map("external_voice_id")
+  sample_asset_id  String?        @map("sample_asset_id")
+  status           VoiceStatus    @default(pending)
+  is_deleted       Boolean        @default(false) @map("is_deleted")
+  created_at       DateTime       @default(now()) @map("created_at")
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@index([user_id])
+  @@map("voice_profiles")
+}
+
+// ============================================
+// 提示词过滤
+// ============================================
+
+model PromptFilterRule {
+  id          String        @id @default(cuid())
+  pattern     String
+  type        FilterRuleType @default(keyword)
+  action      FilterAction  @default(flag)
+  description String?
+  is_active   Boolean       @default(true) @map("is_active")
+  created_at  DateTime      @default(now()) @map("created_at")
+
+  @@map("prompt_filter_rules")
+}
+
+model PromptFilterLog {
+  id           String        @id @default(cuid())
+  user_id      String        @map("user_id")
+  prompt       String
+  matched_rules Json         @map("matched_rules")
+  action       FilterAction
+  created_at   DateTime      @default(now()) @map("created_at")
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@index([user_id])
+  @@map("prompt_filter_logs")
+}
+
+// ============================================
+// 支付
+// ============================================
+
+model PaymentOrder {
+  id               String           @id @default(cuid())
+  life_order_id    String           @unique @map("life_order_id")
+  user_id          String           @map("user_id")
+  team_id          String?          @map("team_id")
+  credit_account_id String?         @map("credit_account_id")
+  amount_fen       Int              @map("amount_fen")
+  credits_to_grant Int              @map("credits_to_grant")
+  status           PaymentStatus    @default(pending)
+  order_type       OrderType        @default(topup) @map("order_type")
+  platform_code    String           @map("platform_code")
+  callback_payload Json?            @map("callback_payload")
+  created_at       DateTime         @default(now()) @map("created_at")
+  paid_at          DateTime?        @map("paid_at")
+
+  user    User?    @relation(fields: [user_id], references: [id])
+  team    Team?    @relation(fields: [team_id], references: [id])
+  creditAccount CreditAccount? @relation(fields: [credit_account_id], references: [id])
+
+  @@index([user_id])
+  @@index([team_id])
+  @@map("payment_orders")
+}
+
+model WebhookLog {
+  id               String   @id @default(cuid())
+  provider         String
+  external_task_id String   @map("external_task_id")
+  payload         Json
+  signature_valid  Boolean  @default(false) @map("signature_valid")
+  processed_at    DateTime @default(now()) @map("processed_at")
+
+  @@map("webhook_logs")
+}
+
+// ============================================
+// 错误日志
+// ============================================
+
+model AiAssistantError {
+  id           String   @id @default(cuid())
+  user_id      String   @map("user_id")
+  http_status  Int?     @map("http_status")
+  error_detail String?  @map("error_detail")
+  created_at   DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@index([user_id])
+  @@map("ai_assistant_errors")
+}
+
+model SubmissionError {
+  id         String          @id @default(cuid())
+  user_id    String          @map("user_id")
+  source     ErrorSource
+  error_code String          @map("error_code")
+  http_status Int?           @map("http_status")
+  detail     String?
+  model      String?
+  canvas_id  String?         @map("canvas_id")
+  created_at DateTime       @default(now()) @map("created_at")
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@index([user_id])
+  @@map("submission_errors")
+}
+
+// ============================================
+// 枚举定义
+// ============================================
+
+enum Role {
+  admin
+  member
+}
+
+enum UserStatus {
+  active
+  suspended
+  deleted
+}
+
+enum PlanTier {
+  free
+  basic
+  pro
+  enterprise
+}
+
+enum EmailVerificationType {
+  verify_email
+  reset_password
+}
+
+enum SubscriptionStatus {
+  active
+  expired
+  cancelled
+}
+
+enum TeamType {
+  standard
+  company_a
+  avatar_enabled
+}
+
+enum TeamRole {
+  owner
+  admin
+  editor
+  viewer
+}
+
+enum WorkspaceRole {
+  admin
+  editor
+  viewer
+}
+
+enum OwnerType {
+  user
+  team
+}
+
+enum QuotaPeriod {
+  weekly
+  monthly
+}
+
+enum LedgerType {
+  topup
+  subscription
+  freeze
+  confirm
+  refund
+  bonus
+  expire
+}
+
+enum TaskModule {
+  image
+  video
+  tts
+  lipsync
+  agent
+  avatar
+  action_imitation
+}
+
+enum BatchStatus {
+  pending
+  processing
+  completed
+  partial_complete
+  failed
+}
+
+enum TaskStatus {
+  pending
+  processing
+  completed
+  failed
+}
+
+enum AssetType {
+  image
+  video
+  audio
+}
+
+enum TransferStatus {
+  pending
+  completed
+  failed
+}
+
+enum ProviderRegion {
+  cn
+  global
+}
+
+enum VoiceStatus {
+  pending
+  ready
+  failed
+}
+
+enum FilterRuleType {
+  keyword
+  regex
+}
+
+enum FilterAction {
+  reject
+  flag
+}
+
+enum PaymentStatus {
+  pending
+  paid
+  failed
+  refunded
+}
+
+enum OrderType {
+  topup
+  subscription
+}
+
+enum ErrorSource {
+  generate_api
+  client
+}

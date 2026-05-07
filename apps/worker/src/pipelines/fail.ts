@@ -1,57 +1,72 @@
-import { getDb } from '@aigc/db'
-import { sql } from 'kysely'
+/**
+ * 任务失败管线
+ *
+ * 在单个事务中完成：
+ * 1. 更新任务状态为失败
+ * 2. 退还冻结积分
+ * 3. 写入积分流水
+ * 4. 更新批次计数
+ *
+ * ⚠️  此处有幂等保护，重复调用安全
+ */
+
+import { prisma } from '../lib/prisma.js'
 import type { GenerationJobData } from '@aigc/types'
 import { getPubRedis } from '../lib/redis.js'
 
+/**
+ * 任务失败管线
+ * @param jobData 任务数据
+ * @param errorMessage 错误信息
+ */
 export async function failPipeline(
   jobData: GenerationJobData,
   errorMessage: string,
 ): Promise<void> {
-  const db = getDb()
   const { taskId, batchId, userId, teamId, creditAccountId, estimatedCredits } = jobData
 
-  await db.transaction().execute(async (trx: any) => {
-    // Idempotency: only process if task is not already terminal
-    const taskUpdate = await trx
-      .updateTable('tasks')
-      .set({
+  // 执行数据库事务
+  await prisma.$transaction(async (tx) => {
+    // 1. 更新任务状态（幂等保护：只更新未完成的任务）
+    const taskUpdate = await tx.task.updateMany({
+      where: {
+        id: taskId,
+        status: { not: 'completed' },
+        NOT: [{ status: 'failed' }],
+      },
+      data: {
         status: 'failed',
         error_message: errorMessage.slice(0, 1000),
-        completed_at: new Date().toISOString(),
-      })
-      .where('id', '=', taskId)
-      .where('status', '!=', 'completed')
-      .where('status', '!=', 'failed')
-      .execute()
+        completed_at: new Date(),
+      },
+    })
 
-    // If no rows updated, task already processed — skip refund
-    if (Number((taskUpdate as any)[0]?.numUpdatedRows ?? (taskUpdate as any).numUpdatedRows ?? 0) === 0) {
+    // 如果任务已处理过，跳过退款
+    if (taskUpdate.count === 0) {
       return
     }
 
-    // 1. Refund credits: frozen -= cost, balance stays (was never deducted from balance)
-    await trx
-      .updateTable('credit_accounts')
-      .set({
-        frozen_credits: sql`frozen_credits - ${estimatedCredits}`,
-      })
-      .where('id', '=', creditAccountId)
-      .execute()
+    // 2. 退还积分：frozen -= cost（积分从未从余额扣除）
+    await tx.creditAccount.update({
+      where: { id: creditAccountId },
+      data: {
+        frozen_credits: { decrement: estimatedCredits },
+      },
+    })
 
-    // Decrement member usage
-    await trx
-      .updateTable('team_members')
-      .set({
-        credit_used: sql`GREATEST(credit_used - ${estimatedCredits}, 0)`,
+    // 3. 调整团队成员积分使用量
+    if (teamId) {
+      await tx.teamMember.updateMany({
+        where: { team_id: teamId, user_id: userId },
+        data: {
+          credit_used: { decrement: estimatedCredits },
+        },
       })
-      .where('team_id', '=', teamId)
-      .where('user_id', '=', userId)
-      .execute()
+    }
 
-    // Insert ledger entry for refund
-    await trx
-      .insertInto('credits_ledger')
-      .values({
+    // 4. 写入积分流水
+    await tx.creditsLedger.create({
+      data: {
         credit_account_id: creditAccountId,
         user_id: userId,
         amount: estimatedCredits,
@@ -59,47 +74,47 @@ export async function failPipeline(
         task_id: taskId,
         batch_id: batchId,
         description: `Image generation failed: ${errorMessage.slice(0, 200)}`,
-      })
-      .execute()
+      },
+    })
 
-    // 2. Update batch counts + check terminal (with row lock)
-    await trx
-      .updateTable('task_batches')
-      .set({
-        failed_count: sql`failed_count + 1`,
-      })
-      .where('id', '=', batchId)
-      .execute()
+    // 5. 更新批次计数
+    await tx.taskBatch.update({
+      where: { id: batchId },
+      data: {
+        failed_count: { increment: 1 },
+      },
+    })
 
-    const batch = await sql`
-      SELECT quantity, completed_count, failed_count, status
-      FROM task_batches WHERE id = ${batchId} FOR UPDATE
-    `.execute(trx)
-    const batchRow = (batch.rows as any[])[0]
+    // 查询批次状态
+    const batch = await tx.taskBatch.findUnique({
+      where: { id: batchId },
+      select: { quantity: true, completed_count: true, failed_count: true, status: true },
+    })
 
-    const totalDone = batchRow.completed_count + batchRow.failed_count
+    if (batch) {
+      const totalDone = batch.completed_count + batch.failed_count
 
-    // #7: If batch is still 'pending' and this is the first finished task, mark processing
-    if (batchRow.status === 'pending' && totalDone === 1) {
-      await trx
-        .updateTable('task_batches')
-        .set({ status: 'processing' })
-        .where('id', '=', batchId)
-        .execute()
-    }
+      // 如果批次仍处于 pending 状态且这是第一个完成的任务，标记为 processing
+      if (batch.status === 'pending' && totalDone === 1) {
+        await tx.taskBatch.update({
+          where: { id: batchId, status: 'pending' },
+          data: { status: 'processing' },
+        })
+      }
 
-    if (totalDone >= batchRow.quantity) {
-      const batchStatus = batchRow.completed_count === 0
-        ? 'failed'
-        : 'partial_complete'
-      await trx
-        .updateTable('task_batches')
-        .set({ status: batchStatus })
-        .where('id', '=', batchId)
-        .execute()
+      // 检查是否需要更新为最终状态
+      if (totalDone >= batch.quantity) {
+        let batchStatus: 'failed' | 'partial_complete' = 'partial_complete'
+        if (batch.completed_count === 0) batchStatus = 'failed'
+
+        await tx.taskBatch.update({
+          where: { id: batchId },
+          data: { status: batchStatus },
+        })
+      }
     }
   })
 
-  // 3. Publish SSE event
+  // 6. 发布 SSE 事件（在事务外）
   await getPubRedis().publish(`sse:batch:${batchId}`, JSON.stringify({ event: 'batch_update' }))
 }

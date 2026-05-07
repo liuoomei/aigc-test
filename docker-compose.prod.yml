@@ -1,0 +1,162 @@
+# ============================================
+# 生产环境 Docker Compose 配置
+# 包含所有服务：MySQL、Redis、MinIO、API、Web、Worker
+# ============================================
+
+version: '3.8'
+
+services:
+  # ── MySQL 数据库 ─────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: aigc
+      MYSQL_USER: ${MYSQL_USER:-aigc}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-aigcpassword}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aigc-network
+    restart: unless-stopped
+
+  # ── Redis 缓存/队列 ──────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - aigc-network
+    restart: unless-stopped
+
+  # ── MinIO 对象存储 ──────────────────────────────────────
+  minio:
+    image: minio/minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - aigc-network
+    restart: unless-stopped
+
+  # ── API 服务 ─────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    ports:
+      - "7001:7001"
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: mysql://${MYSQL_USER:-aigc}:${MYSQL_PASSWORD:-aigcpassword}@mysql:3306/aigc
+      REDIS_URL: redis://redis:6379
+      STORAGE_ENDPOINT: http://minio:9000
+      STORAGE_ACCESS_KEY: minioadmin
+      STORAGE_SECRET_KEY: minioadmin
+      STORAGE_BUCKET: aigc
+      STORAGE_PUBLIC_URL: http://localhost:9000/aigc
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      JWT_ACCESS_EXPIRES_IN: 15m
+      LOG_LEVEL: info
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:6006}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - aigc-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:7001/api/v1/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ── Worker 服务 ──────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: mysql://${MYSQL_USER:-aigc}:${MYSQL_PASSWORD:-aigcpassword}@mysql:3306/aigc
+      REDIS_URL: redis://redis:6379
+      STORAGE_ENDPOINT: http://minio:9000
+      STORAGE_ACCESS_KEY: minioadmin
+      STORAGE_SECRET_KEY: minioadmin
+      STORAGE_BUCKET: aigc
+      STORAGE_PUBLIC_URL: http://localhost:9000/aigc
+      EXTERNAL_STORAGE_URL: http://api:7001/api/v1/assets/external-store
+      EXTERNAL_STORAGE_BASE: http://minio:9000
+      LOG_LEVEL: info
+    env_file:
+      - .env
+      - prompts.env
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - aigc-network
+    restart: unless-stopped
+
+  # ── Web 前端 ─────────────────────────────────────────────
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    ports:
+      - "6006:6006"
+    environment:
+      NODE_ENV: production
+      INTERNAL_API_URL: http://api:7001
+    depends_on:
+      - api
+    networks:
+      - aigc-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:6006/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# ── 数据卷 ───────────────────────────────────────────────
+volumes:
+  mysql_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+
+# ── 网络 ─────────────────────────────────────────────────
+networks:
+  aigc-network:
+    driver: bridge

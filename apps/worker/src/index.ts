@@ -6,10 +6,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 config({ path: path.resolve(__dirname, '../../../.env') })
 config({ path: path.resolve(__dirname, '../../../prompts.env'), override: false })
 
-import { Worker, Queue } from 'bullmq'
+import { Worker } from 'bullmq'
 import pino_ from 'pino'
-import type { GenerationJobData, TransferJobData } from '@aigc/types'
-import { getDb } from '@aigc/db'
+import type { GenerationJobData } from '@aigc/types'
+import { prisma, closePrisma } from './lib/prisma.js'
 import { getAdapter } from './adapters/factory.js'
 import { completePipeline } from './pipelines/complete.js'
 import { failPipeline } from './pipelines/fail.js'
@@ -33,17 +33,8 @@ const imageWorker = new Worker<GenerationJobData>(
     const data = job.data
     logger.info({ jobId: job.id, taskId: data.taskId }, 'Processing image job')
 
-    // Mark task as processing
-    const db = getDb()
-    await db
-      .updateTable('tasks')
-      .set({
-        status: 'processing',
-        processing_started_at: new Date().toISOString(),
-        queue_job_id: job.id ?? null,
-      })
-      .where('id', '=', data.taskId)
-      .execute()
+    // 标记任务为处理中
+    await markTaskProcessing(data.taskId, job.id)
 
     try {
       const adapter = getAdapter(data.provider)
@@ -75,6 +66,18 @@ const imageWorker = new Worker<GenerationJobData>(
 imageWorker.on('error', (err) => {
   logger.error({ err: err.message }, 'Image worker error')
 })
+
+// 标记任务为处理中
+async function markTaskProcessing(taskId: string, jobId: string | undefined): Promise<void> {
+  await prisma.task.update({
+    where: { id: taskId },
+    data: {
+      status: 'processing',
+      processing_started_at: new Date(),
+      queue_job_id: jobId ?? null,
+    },
+  })
+}
 
 logger.info('Worker service started — listening on image-queue')
 logger.info('Transfer worker started — listening on transfer-queue')
@@ -129,6 +132,7 @@ const shutdown = async () => {
   await imageWorker.close()
   await transferWorker.close()
   await closeRedis()
+  await closePrisma()
   process.exit(0)
 }
 

@@ -7,6 +7,7 @@ import rateLimit from '@fastify/rate-limit'
 import multipart from '@fastify/multipart'
 import Redis from 'ioredis'
 import { jwtAuthPlugin } from './plugins/jwt-auth.js'
+import { prisma } from './lib/prisma.js'
 import { healthzRoutes } from './routes/healthz.js'
 import { generateRoutes } from './routes/generate.js'
 import { sseRoutes } from './routes/sse.js'
@@ -64,6 +65,7 @@ export async function buildApp() {
 
   app.addHook('onClose', async () => {
     await redis.quit()
+    await prisma.$disconnect()
   })
 
   // Rate limit
