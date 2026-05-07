@@ -38,7 +38,7 @@ AIGC 创作平台是基于 AI 的图片/视频生成、画布编辑、数字人�
 ```
 aigc-platform/
 ├── aigc-api/         # Fastify 5 + Prisma + MySQL
-├── aigc-web/         # Next.js 15 Pages Router
+├── aigc-web/         # Next.js 15 App Router
 └── aigc-worker/      # Node.js + BullMQ + Prisma
 ```
 
@@ -75,8 +75,7 @@ aigc-worker ◀──http/redis── aigc-api
 | **ORM** | Kysely | Prisma |
 | **迁移方案** | 自定义迁移脚本 | Prisma Migrate |
 | **API 框架** | Fastify 4 | Fastify 5 |
-| **前端框架** | Next.js 14 (Pages Router) | Next.js 15 (Pages Router) |
-| **前端路由** | App Router | Pages Router | 目录名限制 |
+| **前端框架** | Next.js 14 | Next.js 15 | 官方推荐路由 |
 | **UI 组件库** | Radix UI (旧版本) | Radix UI (最新版本) |
 | **样式** | Tailwind CSS 3 | Tailwind CSS 4 |
 | **组件库** | shadcn/ui | shadcn/ui (最新) |
@@ -100,9 +99,8 @@ aigc-worker ◀──http/redis── aigc-api
 
 | 项目 | 技术 | 版本 | 说明 |
 |------|------|------|------|
-| 框架 | Next.js | 15.x | Pages Router |
+| 框架 | Next.js | 15.x | App Router |
 | React | React | 19.x | 升级 |
-| 路由 | Pages Router | - | index.tsx 入口 |
 | 样式 | Tailwind CSS | 4.x | 升级 |
 | 组件库 | shadcn/ui | 最新 | 官方推荐 |
 | 状态管理 | Zustand | 5.x | 保持 |
@@ -167,45 +165,46 @@ aigc-api/
 
 ### 4.2 aigc-web 项目结构
 
-采用 Next.js 页面路由（Pages Router）结构，目录和文件名仅使用字母：
+采用 Next.js App Router（官方推荐）结构：
 
 ```
 aigc-web/
 ├── prisma/                    # 仅用于类型生成
 │   └── schema.prisma
 ├── src/
-│   ├── page/                  # 页面路由（替代 app router）
-│   │   ├── auth/              # 认证路由
+│   ├── app/                   # App Router
+│   │   ├── (auth)/            # 认证路由组（括号不参与 URL）
 │   │   │   ├── login/
-│   │   │   │   └── index.tsx
+│   │   │   │   └── page.tsx
 │   │   │   ├── sso/
-│   │   │   │   └── index.tsx
+│   │   │   │   └── page.tsx
 │   │   │   └── invite/
-│   │   │       └── index.tsx
-│   │   ├── dashboard/         # 主功能路由
+│   │   │       └── page.tsx
+│   │   ├── (dashboard)/      # 主功能路由组
 │   │   │   ├── generation/
-│   │   │   │   └── index.tsx
+│   │   │   │   └── page.tsx
 │   │   │   ├── canvas/
-│   │   │   │   └── index.tsx
+│   │   │   │   └── page.tsx
 │   │   │   ├── video-studio/
-│   │   │   │   └── index.tsx
+│   │   │   │   └── page.tsx
 │   │   │   ├── assets/
-│   │   │   │   └── index.tsx
+│   │   │   │   └── page.tsx
 │   │   │   ├── history/
-│   │   │   │   └── index.tsx
+│   │   │   │   └── page.tsx
 │   │   │   ├── admin/
-│   │   │   │   └── index.tsx
+│   │   │   │   └── page.tsx
 │   │   │   ├── team/
-│   │   │   │   └── index.tsx
+│   │   │   │   └── page.tsx
 │   │   │   ├── credits/
-│   │   │   │   └── index.tsx
+│   │   │   │   └── page.tsx
 │   │   │   └── settings/
-│   │   │       └── index.tsx
+│   │   │       └── page.tsx
 │   │   ├── payment/           # 支付回调
-│   │   │   └── index.tsx
-│   │   ├── index.tsx         # 首页
-│   │   ├── _layout.tsx       # 根布局
-│   │   └── _error.tsx        # 错误页面
+│   │   │   └── page.tsx
+│   │   ├── layout.tsx        # 根布局
+│   │   ├── page.tsx          # 首页
+│   │   ├── loading.tsx       # 加载状态
+│   │   └── error.tsx         # 错误页面
 │   ├── components/            # 组件
 │   │   ├── ui/               # shadcn/ui 基础组件
 │   │   ├── canvas/            # 画布组件
@@ -213,7 +212,7 @@ aigc-web/
 │   │   └── ...
 │   ├── stores/               # Zustand 状态
 │   ├── lib/                  # 工具函数
-│   │   ├── api.ts           # API 请求封装
+│   │   ├── api.ts            # API 请求封装
 │   │   └── utils.ts
 │   └── hooks/                # 自定义 Hooks
 ├── public/                   # 静态资源
