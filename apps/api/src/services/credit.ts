@@ -1,5 +1,4 @@
-import { getDb } from '@aigc/db'
-import { sql } from 'kysely'
+import { prisma } from '../lib/prisma.js'
 
 function computeNextReset(period: string): Date {
   const now = new Date()
@@ -12,95 +11,78 @@ function computeNextReset(period: string): Date {
 
 /**
  * Freeze credits from team pool. Checks member quota if set.
- * Uses FOR UPDATE locks to prevent race conditions.
+ * Uses row-level locks to prevent race conditions.
  */
 export async function freezeCredits(
   teamId: string,
   userId: string,
   amount: number,
 ): Promise<{ creditAccountId: string }> {
-  const db = getDb()
-
-  return await db.transaction().execute(async (trx: any) => {
+  return await prisma.$transaction(async (tx) => {
     // 1. Lock the team credit account FIRST to serialize concurrent requests
-    const account = await sql<{ id: string; balance: number; frozen_credits: number }>`
-      SELECT id, balance, frozen_credits
-      FROM credit_accounts
-      WHERE team_id = ${teamId} AND owner_type = 'team'
-      FOR UPDATE
-    `.execute(trx)
+    const account = await tx.creditAccount.findFirst({
+      where: { team_id: teamId, owner_type: 'team' },
+    })
 
-    const row = account.rows[0]
-    if (!row) {
+    if (!account) {
       throw new Error('未找到团队积分账户')
     }
 
-    if (row.balance - row.frozen_credits < amount) {
+    if (account.balance - account.frozen_credits < amount) {
       throw new Error('团队积分余额不足')
     }
 
     // 2. Lock and check member quota (after team lock to prevent race)
-    const member = await sql<{ credit_quota: number | null; credit_used: number; quota_period: string | null; quota_reset_at: string | null }>`
-      SELECT credit_quota, credit_used, quota_period, quota_reset_at
-      FROM team_members
-      WHERE team_id = ${teamId} AND user_id = ${userId}
-      FOR UPDATE
-    `.execute(trx)
-
-    const memberRow = member.rows[0]
+    const member = await tx.teamMember.findFirst({
+      where: { team_id: teamId, user_id: userId },
+    })
 
     // Auto-reset credit_used if quota period has elapsed
-    if (memberRow?.quota_period && memberRow?.quota_reset_at) {
-      const resetAt = new Date(memberRow.quota_reset_at)
+    if (member?.quota_period && member?.quota_reset_at) {
+      const resetAt = new Date(member.quota_reset_at)
       if (new Date() >= resetAt) {
-        const nextReset = computeNextReset(memberRow.quota_period)
-        await trx.updateTable('team_members').set({
-          credit_used: sql`0`,
-          quota_reset_at: sql`${nextReset.toISOString()}::timestamptz`,
-        }).where('team_id', '=', teamId).where('user_id', '=', userId).execute()
-        memberRow.credit_used = 0
-        memberRow.quota_reset_at = nextReset.toISOString()
+        const nextReset = computeNextReset(member.quota_period)
+        await tx.teamMember.update({
+          where: { team_id_user_id: { team_id: teamId, user_id: userId } },
+          data: {
+            credit_used: 0,
+            quota_reset_at: nextReset,
+          },
+        })
       }
     }
 
-    if (memberRow?.credit_quota !== null && memberRow?.credit_quota !== undefined) {
-      if ((memberRow.credit_used ?? 0) + amount > memberRow.credit_quota) {
+    if (member?.credit_quota !== null && member?.credit_quota !== undefined) {
+      const currentCreditUsed = member.quota_reset_at && new Date() >= new Date(member.quota_reset_at) ? 0 : member.credit_used
+      if ((currentCreditUsed ?? 0) + amount > member.credit_quota) {
         throw new Error('个人积分配额已用尽，请联系团队负责人增加配额')
       }
     }
 
     // 3. Freeze from team pool
-    await trx
-      .updateTable('credit_accounts')
-      .set({
-        frozen_credits: sql`frozen_credits + ${amount}`,
-      })
-      .where('id', '=', row.id)
-      .execute()
+    await tx.creditAccount.update({
+      where: { id: account.id },
+      data: { frozen_credits: { increment: amount } },
+    })
 
     // 4. Update member usage
-    await trx
-      .updateTable('team_members')
-      .set({
-        credit_used: sql`credit_used + ${amount}`,
-      })
-      .where('team_id', '=', teamId)
-      .where('user_id', '=', userId)
-      .execute()
+    await tx.teamMember.update({
+      where: { team_id_user_id: { team_id: teamId, user_id: userId } },
+      data: { credit_used: { increment: amount } },
+    })
 
     // 5. Ledger entry
-    await trx
-      .insertInto('credits_ledger')
-      .values({
-        credit_account_id: row.id,
+    await tx.creditsLedger.create({
+      data: {
+        credit_account_id: account.id,
         user_id: userId,
         amount: -amount,
         type: 'freeze',
         description: 'Credits frozen for image generation',
-      })
-      .execute()
+      },
+    })
 
-    return { creditAccountId: row.id }
+    return { creditAccountId: account.id }
   })
 }
 
@@ -114,22 +96,17 @@ export async function confirmCredits(
   taskId?: string,
   batchId?: string,
 ): Promise<void> {
-  const db = getDb()
-
-  await db.transaction().execute(async (trx: any) => {
-    await trx
-      .updateTable('credit_accounts')
-      .set({
-        balance: sql`balance - ${amount}`,
-        frozen_credits: sql`frozen_credits - ${amount}`,
-        total_spent: sql`total_spent + ${amount}`,
-      })
-      .where('id', '=', creditAccountId)
-      .execute()
-
-    await trx
-      .insertInto('credits_ledger')
-      .values({
+  await prisma.$transaction([
+    prisma.creditAccount.update({
+      where: { id: creditAccountId },
+      data: {
+        balance: { decrement: amount },
+        frozen_credits: { decrement: amount },
+        total_spent: { increment: amount },
+      },
+    }),
+    prisma.creditsLedger.create({
+      data: {
         credit_account_id: creditAccountId,
         user_id: userId,
         amount: -amount,
@@ -137,9 +114,9 @@ export async function confirmCredits(
         task_id: taskId ?? null,
         batch_id: batchId ?? null,
         description: 'Credits confirmed for completed task',
-      })
-      .execute()
-  })
+      },
+    }),
+  ])
 }
 
 /**
@@ -153,31 +130,17 @@ export async function refundCredits(
   taskId?: string,
   batchId?: string,
 ): Promise<void> {
-  const db = getDb()
-
-  await db.transaction().execute(async (trx: any) => {
-    // Unfreeze from team pool
-    await trx
-      .updateTable('credit_accounts')
-      .set({
-        frozen_credits: sql`frozen_credits - ${amount}`,
-      })
-      .where('id', '=', creditAccountId)
-      .execute()
-
-    // Decrement member usage (GREATEST prevents going below 0)
-    await trx
-      .updateTable('team_members')
-      .set({
-        credit_used: sql`GREATEST(credit_used - ${amount}, 0)`,
-      })
-      .where('team_id', '=', teamId)
-      .where('user_id', '=', userId)
-      .execute()
-
-    await trx
-      .insertInto('credits_ledger')
-      .values({
+  await prisma.$transaction([
+    prisma.creditAccount.update({
+      where: { id: creditAccountId },
+      data: { frozen_credits: { decrement: amount } },
+    }),
+    prisma.teamMember.update({
+      where: { team_id_user_id: { team_id: teamId, user_id: userId } },
+      data: { credit_used: { decrement: Math.max(0, amount) } },
+    }),
+    prisma.creditsLedger.create({
+      data: {
         credit_account_id: creditAccountId,
         user_id: userId,
         amount,
@@ -185,7 +148,7 @@ export async function refundCredits(
         task_id: taskId ?? null,
         batch_id: batchId ?? null,
         description: 'Credits refunded for failed task',
-      })
-      .execute()
-  })
+      },
+    }),
+  ])
 }

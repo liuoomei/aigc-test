@@ -5,9 +5,16 @@
   "scripts": {
     "dev": "turbo run dev",
     "build": "turbo run build",
-    "lint": "turbo run lint",
+    "lint": "npm run eslint",
     "db:migrate": "pnpm --filter @aigc/db migrate",
-    "db:seed": "pnpm --filter @aigc/db seed"
+    "db:seed": "pnpm --filter @aigc/db seed",
+    "eslint": "eslint \"**/*.{js,cjs,ts,mjs,jsx,tsx}\"",
+    "lintfix": "npm run eslint -- --fix",
+    "postlint": "template-oss-check",
+    "template-oss-apply": "template-oss-apply --force",
+    "snap": "tap",
+    "test": "tap",
+    "posttest": "npm run lint"
   },
   "devDependencies": {
     "turbo": "^2.0.0",
@@ -17,5 +24,24 @@
   "engines": {
     "node": ">=20.0.0",
     "pnpm": ">=9.0.0"
+  },
+  "author": "GitHub Inc.",
+  "files": [
+    "bin/",
+    "lib/"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jzh-99/aigc-test.git"
+  },
+  "templateOSS": {
+    "//@npmcli/template-oss": "This file is partially managed by @npmcli/template-oss. Edits may be overwritten.",
+    "version": "4.29.0"
+  },
+  "tap": {
+    "nyc-arg": [
+      "--exclude",
+      "tap-snapshots/**"
+    ]
   }
 }

@@ -20,17 +20,17 @@
     "db:studio": "prisma studio"
   },
   "dependencies": {
-    "@prisma/client": "^6.0.0",
     "dotenv": "^16.0.0",
     "kysely": "^0.27.0",
     "pg": "^8.11.0"
   },
   "devDependencies": {
     "@aigc/types": "workspace:*",
+    "@prisma/client": "^6.19.3",
     "@types/bcryptjs": "^3.0.0",
     "@types/pg": "^8.11.0",
     "bcryptjs": "^3.0.3",
-    "prisma": "^6.0.0",
+    "prisma": "^6.19.3",
     "tsx": "^4.7.0",
     "typescript": "^5.4.0"
   }

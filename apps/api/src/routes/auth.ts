@@ -1,9 +1,8 @@
 import type { FastifyInstance } from 'fastify'
-import { getDb } from '@aigc/db'
+import { prisma } from '../lib/prisma.js'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import crypto from 'node:crypto'
-import { sql } from 'kysely'
 import type { LoginRequest, AcceptInviteRequest } from '@aigc/types'
 import { buildUserProfile } from '../services/user-profile.js'
 
@@ -25,9 +24,8 @@ function signRefreshToken(): string {
 }
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
-
   // Account lockout helpers using Redis
-  const redis = (app as any).redis as import('ioredis').default
+  const redis = (app as unknown as { redis: import('ioredis').default }).redis
 
   async function checkAccountLocked(identifier: string): Promise<boolean> {
     const lockKey = `auth:locked:${identifier.toLowerCase()}`
@@ -59,8 +57,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       rateLimit: {
         max: 10,
         timeWindow: '1 minute',
-        keyGenerator: (request: any) => request.ip,
-        errorResponseBuilder: (_request: any, context: any) => ({
+        keyGenerator: (request: { ip: string }) => request.ip,
+        errorResponseBuilder: (_request: unknown, context: { ttl: number }) => ({
           statusCode: 429,
           success: false,
           error: { code: 'RATE_LIMITED', message: `请求过于频繁，请 ${Math.ceil(context.ttl / 1000)} 秒后再试` },
@@ -89,14 +87,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       })
     }
 
-    const db = getDb()
-    const user = await db
-      .selectFrom('users')
-      .select(['id', 'account', 'username', 'password_hash', 'role', 'status'])
-      .where('account', '=', identifier.toLowerCase())
-      .executeTakeFirst()
+    const user = await prisma.user.findFirst({
+      where: { account: identifier.toLowerCase() },
+      select: { id: true, account: true, username: true, password_hash: true, role: true, status: true },
+    })
 
-    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+    if (!user || !user.password_hash || !(await bcrypt.compare(password, user.password_hash))) {
       await recordFailedAttempt(identifier)
       // If user exists but is suspended, reveal that rather than a generic credentials error
       if (user && user.status !== 'active') {
@@ -122,12 +118,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     await clearFailedAttempts(identifier)
 
     // Revoke all older refresh tokens to enforce single session
-    await db
-      .updateTable('refresh_tokens')
-      .set({ revoked_at: sql`NOW()` })
-      .where('user_id', '=', user.id)
-      .where('revoked_at', 'is', null)
-      .execute()
+    await prisma.refreshToken.updateMany({
+      where: { user_id: user.id, revoked_at: null },
+      data: { revoked_at: new Date() },
+    })
 
     // Publish kick event to other devices
     const sessionVersion = Math.floor(Date.now() / 1000)
@@ -137,11 +131,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const refreshToken = signRefreshToken()
     const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex')
 
-    await db.insertInto('refresh_tokens').values({
-      user_id: user.id,
-      token_hash: tokenHash,
-      expires_at: sql`NOW() + INTERVAL '7 days'`,
-    }).execute()
+    const expiresAt = new Date()
+    expiresAt.setDate(expiresAt.getDate() + 7)
+
+    await prisma.refreshToken.create({
+      data: {
+        user_id: user.id,
+        token_hash: tokenHash,
+        expires_at: expiresAt,
+      },
+    })
 
     reply.setCookie('refresh_token', refreshToken, {
       httpOnly: true,
@@ -151,7 +150,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       maxAge: 7 * 24 * 60 * 60,
     })
 
-    const profile = await buildUserProfile(db, user.id)
+    const profile = await buildUserProfile(prisma, user.id)
     return { access_token: accessToken, user: profile }
   })
 
@@ -165,17 +164,14 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       })
     }
 
-    const db = getDb()
     const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex')
 
-    const stored = await db
-      .selectFrom('refresh_tokens')
-      .innerJoin('users', 'users.id', 'refresh_tokens.user_id')
-      .select(['users.id', 'users.account', 'users.role', 'users.status', 'refresh_tokens.id as token_id', 'refresh_tokens.expires_at', 'refresh_tokens.revoked_at'])
-      .where('refresh_tokens.token_hash', '=', tokenHash)
-      .executeTakeFirst()
+    const stored = await prisma.refreshToken.findFirst({
+      where: { token_hash: tokenHash },
+      include: { user: { select: { id: true, account: true, role: true, status: true } } },
+    })
 
-    if (!stored || new Date(String(stored.expires_at)) < new Date()) {
+    if (!stored || stored.expires_at < new Date()) {
       return reply.status(401).send({
         success: false,
         error: { code: 'INVALID_REFRESH_TOKEN', message: 'Invalid or expired refresh token' },
@@ -185,12 +181,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // Refresh token reuse detection: if a revoked token is presented,
     // an attacker may have stolen it. Revoke ALL tokens for this user.
     if (stored.revoked_at) {
-      await db
-        .updateTable('refresh_tokens')
-        .set({ revoked_at: sql`NOW()` })
-        .where('user_id', '=', stored.id)
-        .where('revoked_at', 'is', null)
-        .execute()
+      await prisma.refreshToken.updateMany({
+        where: { user_id: stored.user_id, revoked_at: null },
+        data: { revoked_at: new Date() },
+      })
 
       reply.clearCookie('refresh_token', { path: '/api/v1/auth' })
       return reply.status(401).send({
@@ -199,13 +193,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       })
     }
 
-    if (stored.status !== 'active') {
+    if (stored.user.status !== 'active') {
       // Revoke the token so it can't be reused
-      await db
-        .updateTable('refresh_tokens')
-        .set({ revoked_at: sql`NOW()` })
-        .where('id', '=', stored.token_id)
-        .execute()
+      await prisma.refreshToken.update({
+        where: { id: stored.id },
+        data: { revoked_at: new Date() },
+      })
 
       reply.clearCookie('refresh_token', { path: '/api/v1/auth' })
 
@@ -218,20 +211,22 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // Atomic token rotation: revoke old + create new in one transaction
     const newRefreshToken = signRefreshToken()
     const newTokenHash = crypto.createHash('sha256').update(newRefreshToken).digest('hex')
+    const newExpiresAt = new Date()
+    newExpiresAt.setDate(newExpiresAt.getDate() + 7)
 
-    await db.transaction().execute(async (trx) => {
-      await trx
-        .updateTable('refresh_tokens')
-        .set({ revoked_at: sql`NOW()` })
-        .where('id', '=', stored.token_id)
-        .execute()
-
-      await trx.insertInto('refresh_tokens').values({
-        user_id: stored.id,
-        token_hash: newTokenHash,
-        expires_at: sql`NOW() + INTERVAL '7 days'`,
-      }).execute()
-    })
+    await prisma.$transaction([
+      prisma.refreshToken.update({
+        where: { id: stored.id },
+        data: { revoked_at: new Date() },
+      }),
+      prisma.refreshToken.create({
+        data: {
+          user_id: stored.user_id,
+          token_hash: newTokenHash,
+          expires_at: newExpiresAt,
+        },
+      }),
+    ])
 
     reply.setCookie('refresh_token', newRefreshToken, {
       httpOnly: true,
@@ -241,8 +236,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       maxAge: 7 * 24 * 60 * 60,
     })
 
-    const accessToken = signAccessToken({ id: stored.id, account: stored.account, role: stored.role })
-    const profile = await buildUserProfile(db, stored.id)
+    const accessToken = signAccessToken({ id: stored.user_id, account: stored.user.account, role: stored.user.role })
+    const profile = await buildUserProfile(prisma, stored.user_id)
     return { access_token: accessToken, user: profile }
   })
 
@@ -250,13 +245,11 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   app.post('/auth/logout', async (request, reply) => {
     const refreshToken = (request.cookies as Record<string, string | undefined>)?.refresh_token
     if (refreshToken) {
-      const db = getDb()
       const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex')
-      await db
-        .updateTable('refresh_tokens')
-        .set({ revoked_at: sql`NOW()` })
-        .where('token_hash', '=', tokenHash)
-        .execute()
+      await prisma.refreshToken.updateMany({
+        where: { token_hash: tokenHash },
+        data: { revoked_at: new Date() },
+      })
     }
 
     reply.clearCookie('refresh_token', { path: '/api/v1/auth' })
@@ -296,29 +289,24 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       return reply.badRequest('密码必须包含字母和数字')
     }
 
-    const db = getDb()
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
 
     // Use transaction to prevent concurrent accept-invite race
-    const result = await db.transaction().execute(async (trx) => {
-      const invite = await sql<{ id: string; user_id: string; expires_at: string; used_at: string | null }>`
-        SELECT id, user_id, expires_at, used_at
-        FROM email_verifications
-        WHERE token_hash = ${tokenHash} AND type = 'verify_email'
-        FOR UPDATE
-      `.execute(trx)
+    const result = await prisma.$transaction(async (tx) => {
+      const invite = await tx.emailVerification.findFirst({
+        where: { token_hash: tokenHash, type: 'verify_email' },
+        orderBy: { created_at: 'desc' },
+      })
 
-      const inviteRow = invite.rows[0]
-      if (!inviteRow || inviteRow.used_at || new Date(String(inviteRow.expires_at)) < new Date()) {
+      if (!invite || invite.used_at || (invite.expires_at && invite.expires_at < new Date())) {
         return { error: 'INVALID_INVITE' as const }
       }
 
       // Verify identifier matches the invited user
-      const invitedUser = await trx
-        .selectFrom('users')
-        .select(['id', 'email', 'phone', 'account'])
-        .where('id', '=', inviteRow.user_id)
-        .executeTakeFirst()
+      const invitedUser = await tx.user.findFirst({
+        where: { id: invite.user_id },
+        select: { id: true, email: true, phone: true, account: true },
+      })
 
       if (!invitedUser) {
         return { error: 'INVALID_INVITE' as const }
@@ -334,23 +322,19 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
       const pwHash = await bcrypt.hash(password, BCRYPT_ROUNDS)
 
-
       // Update the pre-created user with real credentials
-      await trx
-        .updateTable('users')
-        .set({ username, password_hash: pwHash, status: 'active' })
-        .where('id', '=', inviteRow.user_id)
-        .execute()
+      await tx.user.update({
+        where: { id: invite.user_id },
+        data: { username, password_hash: pwHash, status: 'active' },
+      })
 
       // Mark this token as used + invalidate any other unused tokens for this user
-      await trx
-        .updateTable('email_verifications')
-        .set({ used_at: sql`NOW()` })
-        .where('user_id', '=', inviteRow.user_id)
-        .where('used_at', 'is', null)
-        .execute()
+      await tx.emailVerification.updateMany({
+        where: { user_id: invite.user_id, used_at: null },
+        data: { used_at: new Date() },
+      })
 
-      return { userId: inviteRow.user_id }
+      return { userId: invite.user_id }
     })
 
     if ('error' in result) {
@@ -366,19 +350,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       })
     }
 
-    const user = await db
-      .selectFrom('users')
-      .select(['id', 'account', 'role'])
-      .where('id', '=', result.userId)
-      .executeTakeFirstOrThrow()
+    const user = await prisma.user.findFirstOrThrow({
+      where: { id: result.userId },
+      select: { id: true, account: true, role: true },
+    })
 
     // Revoke all older refresh tokens to enforce single session
-    await db
-      .updateTable('refresh_tokens')
-      .set({ revoked_at: sql`NOW()` })
-      .where('user_id', '=', user.id)
-      .where('revoked_at', 'is', null)
-      .execute()
+    await prisma.refreshToken.updateMany({
+      where: { user_id: user.id, revoked_at: null },
+      data: { revoked_at: new Date() },
+    })
 
     // Publish kick event to other devices
     const sessionVersion = Math.floor(Date.now() / 1000)
@@ -388,11 +369,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const refreshTokenStr = signRefreshToken()
     const refreshHash = crypto.createHash('sha256').update(refreshTokenStr).digest('hex')
 
-    await db.insertInto('refresh_tokens').values({
-      user_id: user.id,
-      token_hash: refreshHash,
-      expires_at: sql`NOW() + INTERVAL '7 days'`,
-    }).execute()
+    const expiresAt = new Date()
+    expiresAt.setDate(expiresAt.getDate() + 7)
+
+    await prisma.refreshToken.create({
+      data: {
+        user_id: user.id,
+        token_hash: refreshHash,
+        expires_at: expiresAt,
+      },
+    })
 
     reply.setCookie('refresh_token', refreshTokenStr, {
       httpOnly: true,
@@ -402,7 +388,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       maxAge: 7 * 24 * 60 * 60,
     })
 
-    const profile = await buildUserProfile(db, user.id)
+    const profile = await buildUserProfile(prisma, user.id)
     return reply.status(201).send({ access_token: accessToken, user: profile })
   })
 
@@ -434,12 +420,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       })
     }
 
-    const db = getDb()
-    const user = await db
-      .selectFrom('users')
-      .select(['id', 'account', 'role', 'status'])
-      .where('id', '=', payload.sub)
-      .executeTakeFirst()
+    const user = await prisma.user.findFirst({
+      where: { id: payload.sub },
+      select: { id: true, account: true, role: true, status: true },
+    })
 
     if (!user) {
       return reply.status(404).send({
@@ -456,26 +440,28 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Same session establishment as normal login
-    await db
-      .updateTable('refresh_tokens')
-      .set({ revoked_at: sql`NOW()` })
-      .where('user_id', '=', user.id)
-      .where('revoked_at', 'is', null)
-      .execute()
+    await prisma.refreshToken.updateMany({
+      where: { user_id: user.id, revoked_at: null },
+      data: { revoked_at: new Date() },
+    })
 
     const sessionVersion = Math.floor(Date.now() / 1000)
-    const redis = (app as any).redis as import('ioredis').default
     await redis.set(`user:session_version:${user.id}`, sessionVersion.toString(), 'EX', 7 * 24 * 60 * 60)
 
     const accessToken = signAccessToken({ id: user.id, account: user.account, role: user.role })
     const refreshTokenStr = signRefreshToken()
     const refreshHash = crypto.createHash('sha256').update(refreshTokenStr).digest('hex')
 
-    await db.insertInto('refresh_tokens').values({
-      user_id: user.id,
-      token_hash: refreshHash,
-      expires_at: sql`NOW() + INTERVAL '7 days'`,
-    }).execute()
+    const expiresAt = new Date()
+    expiresAt.setDate(expiresAt.getDate() + 7)
+
+    await prisma.refreshToken.create({
+      data: {
+        user_id: user.id,
+        token_hash: refreshHash,
+        expires_at: expiresAt,
+      },
+    })
 
     reply.setCookie('refresh_token', refreshTokenStr, {
       httpOnly: true,
@@ -485,7 +471,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       maxAge: 7 * 24 * 60 * 60,
     })
 
-    const profile = await buildUserProfile(db, user.id)
+    const profile = await buildUserProfile(prisma, user.id)
     return { access_token: accessToken, user: profile }
   })
 }

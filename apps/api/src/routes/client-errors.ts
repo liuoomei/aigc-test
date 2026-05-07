@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import rateLimit from '@fastify/rate-limit'
-import { getDb } from '@aigc/db'
+import { prisma } from '../lib/prisma.js'
 import { stripHtml } from '../lib/sanitize.js'
 
 export async function clientErrorsRoutes(app: FastifyInstance): Promise<void> {
@@ -33,16 +33,18 @@ export async function clientErrorsRoutes(app: FastifyInstance): Promise<void> {
   }, async (request) => {
     const detail = request.body.detail ? stripHtml(request.body.detail).slice(0, 1000) : null
 
-    getDb().insertInto('submission_errors').values({
-      user_id: request.user.id,
-      source: 'client',
-      error_code: request.body.error_code,
-      http_status: request.body.http_status ?? null,
-      detail,
-      model: request.body.model ?? null,
-      canvas_id: request.body.canvas_id ?? null,
-    }).execute().catch((err) => {
-      app.log.warn({ err, errorCode: request.body.error_code }, 'Failed to log client submission error')
+    prisma.submissionError.create({
+      data: {
+        user_id: request.user.id,
+        source: 'client',
+        error_code: request.body.error_code,
+        http_status: request.body.http_status ?? null,
+        detail,
+        model: request.body.model ?? null,
+        canvas_id: request.body.canvas_id ?? null,
+      },
+    }).catch((err) => {
+      app.log.warn({ err, error_code: request.body.error_code }, 'Failed to log client submission error')
     })
 
     return { success: true }

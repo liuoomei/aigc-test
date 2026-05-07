@@ -6,7 +6,6 @@
 
 generator client {
   provider = "prisma-client-js"
-  output   = "../node_modules/.prisma/client"
 }
 
 datasource db {
@@ -51,6 +50,10 @@ model User {
   aiAssistantErrors  AiAssistantError[]
   submissionErrors   SubmissionError[]
   workspaceMembers   WorkspaceMember[]
+  subscriptions      UserSubscription[]
+  canvases           Canvas[]
+  videoProjects      VideoStudioProject[]
+  ledger             CreditsLedger[]
 
   @@map("users")
 }
@@ -201,7 +204,7 @@ model Workspace {
   members   WorkspaceMember[]
   canvases   Canvas[]
   videoProjects VideoStudioProject[]
-  quotas     QuotaPeriod[]
+  quotas     Json?
 
   @@index([team_id])
   @@index([created_by])
@@ -242,6 +245,7 @@ model CreditAccount {
   team    Team?     @relation(fields: [team_id], references: [id], onDelete: Cascade)
   ledger  CreditsLedger[]
   taskBatches TaskBatch[]
+  paymentOrders PaymentOrder[]
 
   @@map("credit_accounts")
 }
@@ -258,9 +262,11 @@ model CreditsLedger {
   created_at      DateTime     @default(now()) @map("created_at")
 
   creditAccount CreditAccount @relation(fields: [credit_account_id], references: [id], onDelete: Cascade)
+  taskBatch     TaskBatch?    @relation(fields: [batch_id], references: [id], onDelete: SetNull)
+  user          User          @relation(fields: [user_id], references: [id], onDelete: Cascade)
 
   @@index([credit_account_id])
-  @@index([user_id, createdAt])
+  @@index([user_id, created_at])
   @@map("credits_ledger")
 }
 
@@ -301,10 +307,11 @@ model TaskBatch {
   creditAccount  CreditAccount? @relation(fields: [credit_account_id], references: [id])
   tasks          Task[]
   assets         Asset[]
+  ledger         CreditsLedger[]
 
   @@index([user_id])
   @@index([team_id])
-  @@index([status, createdAt])
+  @@index([status, created_at])
   @@map("task_batches")
 }
 
@@ -323,6 +330,8 @@ model Task {
   processing_started_at DateTime? @map("processing_started_at")
   completed_at       DateTime?   @map("completed_at")
   error_message     String?     @map("error_message")
+  created_at         DateTime    @default(now()) @map("created_at")
+  updated_at         DateTime    @updatedAt @map("updated_at")
 
   batch  TaskBatch @relation(fields: [batch_id], references: [id], onDelete: Cascade)
   user   User      @relation(fields: [user_id], references: [id])
@@ -330,7 +339,7 @@ model Task {
 
   @@index([batch_id])
   @@index([user_id])
-  @@index([status, createdAt])
+  @@index([status, created_at])
   @@map("tasks")
 }
 
@@ -416,21 +425,27 @@ model CanvasNodeOutput {
 // ============================================
 
 model VideoStudioProject {
-  id           String    @id @default(cuid())
-  workspace_id String    @map("workspace_id")
-  user_id      String    @map("user_id")
-  name         String
-  wizard_state Json      @map("wizard_state")
-  is_deleted   Boolean   @default(false) @map("is_deleted")
-  deleted_at   DateTime? @map("deleted_at")
-  created_at   DateTime  @default(now()) @map("created_at")
-  updated_at   DateTime  @updatedAt @map("updated_at")
+  id               String    @id @default(cuid())
+  workspace_id     String    @map("workspace_id")
+  user_id          String    @map("user_id")
+  name             String
+  wizard_state     Json      @map("wizard_state")
+  project_type     String    @default("single") @map("project_type")
+  series_parent_id String?   @map("series_parent_id")
+  episode_index    Int?      @map("episode_index")
+  is_deleted       Boolean   @default(false) @map("is_deleted")
+  deleted_at       DateTime? @map("deleted_at")
+  created_at       DateTime  @default(now()) @map("created_at")
+  updated_at       DateTime  @updatedAt @map("updated_at")
 
-  workspace Workspace @relation(fields: [workspace_id], references: [id])
-  creator   User      @relation(fields: [user_id], references: [id])
+  workspace     Workspace              @relation(fields: [workspace_id], references: [id])
+  creator       User                   @relation(fields: [user_id], references: [id])
+  seriesParent  VideoStudioProject?    @relation("SeriesEpisodes", fields: [series_parent_id], references: [id])
+  episodes      VideoStudioProject[]   @relation("SeriesEpisodes")
 
   @@index([workspace_id])
   @@index([user_id])
+  @@index([series_parent_id])
   @@map("video_studio_projects")
 }
 
@@ -504,12 +519,12 @@ model PromptFilterRule {
 }
 
 model PromptFilterLog {
-  id           String        @id @default(cuid())
-  user_id      String        @map("user_id")
+  id           String   @id @default(cuid())
+  user_id      String   @map("user_id")
   prompt       String
-  matched_rules Json         @map("matched_rules")
-  action       FilterAction
-  created_at   DateTime      @default(now()) @map("created_at")
+  matched_rules Json    @map("matched_rules")
+  action       String
+  created_at   DateTime @default(now()) @map("created_at")
 
   user User @relation(fields: [user_id], references: [id])
 
@@ -523,11 +538,15 @@ model PromptFilterLog {
 
 model PaymentOrder {
   id               String           @id @default(cuid())
+  order_no         String           @unique @map("order_no")
   life_order_id    String           @unique @map("life_order_id")
+  provider         String           @default("life")
+  type             String           @default("topup")
   user_id          String           @map("user_id")
   team_id          String?          @map("team_id")
   credit_account_id String?         @map("credit_account_id")
   amount_fen       Int              @map("amount_fen")
+  credits          Int              @default(0)
   credits_to_grant Int              @map("credits_to_grant")
   status           PaymentStatus    @default(pending)
   order_type       OrderType        @default(topup) @map("order_type")
@@ -735,4 +754,14 @@ enum OrderType {
 enum ErrorSource {
   generate_api
   client
+}
+model ConcatJob {
+  id         String   @id @default(cuid())
+  status     String   @default("processing")
+  result_url String?  @map("result_url")
+  error      String?
+  created_at DateTime @default(now()) @map("created_at")
+  updated_at DateTime @updatedAt @map("updated_at")
+
+  @@map("concat_jobs")
 }

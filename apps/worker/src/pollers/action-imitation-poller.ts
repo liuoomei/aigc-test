@@ -1,6 +1,5 @@
 import pino_ from 'pino'
-import { getDb } from '@aigc/db'
-import { sql } from 'kysely'
+import { prisma } from '../lib/prisma.js'
 import { getPubRedis, getRedis } from '../lib/redis.js'
 import { Queue } from 'bullmq'
 import { buildSignedRequest } from '../lib/volcengine-visual-sign.js'
@@ -18,7 +17,7 @@ function getTransferQueue(): Queue {
 
 const pollErrorCounts = new Map<string, number>()
 const MAX_CONSECUTIVE_POLL_ERRORS = 5
-const MAX_AGE_MS = 35 * 60 * 1000 // 35 minutes (RTF≈18, 30s video≈9min + buffer)
+const MAX_AGE_MS = 35 * 60 * 1000
 
 const ACTION_REQ_KEY = 'jimeng_dreamactor_m20_gen_video'
 const ACTION_API_VERSION = '2022-08-31'
@@ -56,7 +55,6 @@ async function checkActionTask(externalTaskId: string): Promise<{
     }
 
     if (json.code !== 10000) {
-      // Non-retryable moderation errors
       if ([50411, 50412, 50413, 50513].includes(json.code)) {
         return { status: 'FAILURE', failReason: `审核未通过 (${json.code}): ${json.message}` }
       }
@@ -71,7 +69,6 @@ async function checkActionTask(externalTaskId: string): Promise<{
     if (taskStatus === 'not_found' || taskStatus === 'expired') {
       return { status: 'FAILURE', failReason: `任务状态: ${taskStatus}` }
     }
-    // processing, in_queue, generating
     return { status: 'IN_PROGRESS' }
   } catch {
     return { status: 'POLL_ERROR' }
@@ -81,48 +78,46 @@ async function checkActionTask(externalTaskId: string): Promise<{
 }
 
 async function handleActionSuccess(task: ActionTaskRow, videoUrl: string): Promise<void> {
-  const db = getDb()
-  const { taskId, batchId, userId, teamId, creditAccountId, estimatedCredits } = task
+  const { taskId, batchId, userId, creditAccountId, estimatedCredits } = task
 
-  await db.transaction().execute(async (trx: any) => {
-    const taskUpdate = await trx
-      .updateTable('tasks')
-      .set({ status: 'completed', credits_cost: estimatedCredits, completed_at: new Date().toISOString() })
-      .where('id', '=', taskId)
-      .where('status', '!=', 'completed')
-      .where('status', '!=', 'failed')
-      .execute()
+  await prisma.$transaction(async (trx) => {
+    const updated = await trx.task.updateMany({
+      where: { id: taskId, status: { notIn: ['completed', 'failed'] } },
+      data: { status: 'completed', credits_cost: estimatedCredits, completed_at: new Date() },
+    })
+    if (updated.count === 0) return
 
-    if (Number((taskUpdate as any)[0]?.numUpdatedRows ?? (taskUpdate as any).numUpdatedRows ?? 0) === 0) return
+    await trx.asset.create({
+      data: { task_id: taskId, batch_id: batchId, user_id: userId, type: 'video', original_url: videoUrl, transfer_status: 'pending' },
+    })
 
-    await trx.insertInto('assets').values({
-      task_id: taskId, batch_id: batchId, user_id: userId,
-      type: 'video', original_url: videoUrl, transfer_status: 'pending',
-    }).execute()
+    await trx.creditAccount.update({
+      where: { id: creditAccountId },
+      data: {
+        frozen_credits: { decrement: estimatedCredits },
+        total_spent: { increment: estimatedCredits },
+        balance: { decrement: estimatedCredits },
+      },
+    })
 
-    await trx.updateTable('credit_accounts').set({
-      frozen_credits: sql`frozen_credits - ${estimatedCredits}`,
-      total_spent: sql`total_spent + ${estimatedCredits}`,
-      balance: sql`balance - ${estimatedCredits}`,
-    }).where('id', '=', creditAccountId).execute()
+    await trx.creditsLedger.create({
+      data: {
+        credit_account_id: creditAccountId, user_id: userId,
+        amount: -estimatedCredits, type: 'confirm',
+        task_id: taskId, batch_id: batchId,
+        description: 'Action Imitation generation confirmed',
+      },
+    })
 
-    await trx.insertInto('credits_ledger').values({
-      credit_account_id: creditAccountId, user_id: userId,
-      amount: -estimatedCredits, type: 'confirm',
-      task_id: taskId, batch_id: batchId,
-      description: 'Action Imitation generation confirmed',
-    }).execute()
-
-    await trx.updateTable('task_batches').set({
-      status: 'completed',
-      completed_count: sql`completed_count + 1`,
-      actual_credits: sql`actual_credits + ${estimatedCredits}`,
-    }).where('id', '=', batchId).execute()
+    await trx.taskBatch.update({
+      where: { id: batchId },
+      data: { status: 'completed', completed_count: { increment: 1 }, actual_credits: { increment: estimatedCredits } },
+    })
   })
 
   await getPubRedis().publish(`sse:batch:${batchId}`, JSON.stringify({ event: 'batch_update' }))
 
-  const assetRow = await db.selectFrom('assets').select('id').where('task_id', '=', taskId).executeTakeFirst()
+  const assetRow = await prisma.asset.findFirst({ where: { task_id: taskId }, select: { id: true } })
   if (assetRow) {
     await getTransferQueue().add('transfer', { taskId, assetId: assetRow.id, originalUrl: videoUrl, assetType: 'video' })
   }
@@ -131,29 +126,38 @@ async function handleActionSuccess(task: ActionTaskRow, videoUrl: string): Promi
 }
 
 async function handleActionFailure(task: ActionTaskRow, errorMessage: string): Promise<void> {
-  const db = getDb()
   const { taskId, batchId, userId, teamId, creditAccountId, estimatedCredits } = task
 
-  await db.transaction().execute(async (trx: any) => {
-    const taskUpdate = await trx
-      .updateTable('tasks')
-      .set({ status: 'failed', error_message: errorMessage.slice(0, 1000), completed_at: new Date().toISOString() })
-      .where('id', '=', taskId)
-      .where('status', '!=', 'completed')
-      .where('status', '!=', 'failed')
-      .execute()
+  await prisma.$transaction(async (trx) => {
+    const updated = await trx.task.updateMany({
+      where: { id: taskId, status: { notIn: ['completed', 'failed'] } },
+      data: { status: 'failed', error_message: errorMessage.slice(0, 1000), completed_at: new Date() },
+    })
+    if (updated.count === 0) return
 
-    if (Number((taskUpdate as any)[0]?.numUpdatedRows ?? (taskUpdate as any).numUpdatedRows ?? 0) === 0) return
+    await trx.creditAccount.update({
+      where: { id: creditAccountId },
+      data: { frozen_credits: { decrement: estimatedCredits } },
+    })
 
-    await trx.updateTable('credit_accounts').set({ frozen_credits: sql`frozen_credits - ${estimatedCredits}` }).where('id', '=', creditAccountId).execute()
-    await trx.updateTable('team_members').set({ credit_used: sql`GREATEST(credit_used - ${estimatedCredits}, 0)` }).where('team_id', '=', teamId).where('user_id', '=', userId).execute()
-    await trx.insertInto('credits_ledger').values({
-      credit_account_id: creditAccountId, user_id: userId,
-      amount: estimatedCredits, type: 'refund',
-      task_id: taskId, batch_id: batchId,
-      description: `Action Imitation failed: ${errorMessage.slice(0, 200)}`,
-    }).execute()
-    await trx.updateTable('task_batches').set({ status: 'failed', failed_count: sql`failed_count + 1` }).where('id', '=', batchId).execute()
+    await trx.teamMember.updateMany({
+      where: { team_id: teamId, user_id: userId },
+      data: { credit_used: { decrement: estimatedCredits } },
+    })
+
+    await trx.creditsLedger.create({
+      data: {
+        credit_account_id: creditAccountId, user_id: userId,
+        amount: estimatedCredits, type: 'refund',
+        task_id: taskId, batch_id: batchId,
+        description: `Action Imitation failed: ${errorMessage.slice(0, 200)}`,
+      },
+    })
+
+    await trx.taskBatch.update({
+      where: { id: batchId },
+      data: { status: 'failed', failed_count: { increment: 1 } },
+    })
   })
 
   await getPubRedis().publish(`sse:batch:${batchId}`, JSON.stringify({ event: 'batch_update' }))
@@ -161,25 +165,34 @@ async function handleActionFailure(task: ActionTaskRow, errorMessage: string): P
 }
 
 async function pollActionTasks(): Promise<void> {
-  const db = getDb()
+  const rows = await prisma.task.findMany({
+    where: {
+      status: 'processing',
+      external_task_id: { not: null },
+      batch: { module: 'action_imitation' },
+    },
+    select: {
+      id: true,
+      external_task_id: true,
+      batch_id: true,
+      estimated_credits: true,
+      processing_started_at: true,
+      batch: { select: { team_id: true, user_id: true, credit_account_id: true } },
+    },
+  })
 
-  const tasks = await db
-    .selectFrom('tasks')
-    .innerJoin('task_batches', 'tasks.batch_id', 'task_batches.id')
-    .select([
-      'tasks.id as taskId',
-      'tasks.external_task_id as externalTaskId',
-      'tasks.batch_id as batchId',
-      'tasks.estimated_credits as estimatedCredits',
-      'tasks.processing_started_at as processingStartedAt',
-      'task_batches.team_id as teamId',
-      'task_batches.user_id as userId',
-      'task_batches.credit_account_id as creditAccountId',
-    ])
-    .where('tasks.status', '=', 'processing')
-    .where('task_batches.module', '=', 'action_imitation' as any)
-    .where('tasks.external_task_id', 'is not', null)
-    .execute() as ActionTaskRow[]
+  const tasks: ActionTaskRow[] = rows
+    .filter((r) => r.batch?.team_id && r.batch?.credit_account_id)
+    .map((r) => ({
+      taskId: r.id,
+      externalTaskId: r.external_task_id!,
+      batchId: r.batch_id,
+      estimatedCredits: r.estimated_credits,
+      processingStartedAt: r.processing_started_at?.toISOString() ?? null,
+      teamId: r.batch!.team_id!,
+      userId: r.batch!.user_id,
+      creditAccountId: r.batch!.credit_account_id!,
+    }))
 
   if (tasks.length === 0) return
   logger.debug({ count: tasks.length }, 'Polling action imitation tasks')

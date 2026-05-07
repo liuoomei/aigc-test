@@ -30,7 +30,7 @@ declare module 'fastify' {
     user: AuthUser
   }
   interface FastifyInstance {
-    redis: import('ioredis').default
+    redis: import('ioredis').Redis
   }
 }
 
@@ -39,9 +39,9 @@ export const jwtAuthPlugin = fp(async function jwtAuth(app: FastifyInstance): Pr
   if (!secret) throw new Error('JWT_SECRET is required')
   if (secret.length < 32) throw new Error('JWT_SECRET must be at least 32 characters')
 
-  app.decorateRequest('user', null)
+  app.decorateRequest('user', null as unknown as AuthUser)
 
-  const redis = (app as any).redis as import('ioredis').default
+  const redis = (app as unknown as { redis: import('ioredis').Redis }).redis
 
   app.addHook('onRequest', async (request, reply) => {
     if (PUBLIC_ROUTES.some((r) => request.url.startsWith(r))) return

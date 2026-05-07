@@ -1,5 +1,5 @@
 import type { FastifyRequest, FastifyReply } from 'fastify'
-import { getDb } from '@aigc/db'
+import { prisma } from '../lib/prisma.js'
 
 const TEAM_ROLE_RANK: Record<string, number> = { viewer: 0, editor: 1, admin: 2, owner: 3 }
 const WS_ROLE_RANK: Record<string, number> = { viewer: 0, editor: 1, admin: 2 }
@@ -17,16 +17,12 @@ export function adminGuard() {
 
 export function teamRoleGuard(requiredRole: string) {
   return async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
-    // Admin bypasses team role check
     if (request.user.role === 'admin') return
 
-    const db = getDb()
-    const membership = await db
-      .selectFrom('team_members')
-      .select('role')
-      .where('team_id', '=', request.params.id)
-      .where('user_id', '=', request.user.id)
-      .executeTakeFirst()
+    const membership = await prisma.teamMember.findFirst({
+      where: { team_id: request.params.id, user_id: request.user.id },
+      select: { role: true },
+    })
 
     if (!membership) {
       return reply.status(403).send({
@@ -54,23 +50,19 @@ export function workspaceTeamOwnerGuard() {
   return async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
     if (request.user.role === 'admin') return
 
-    const db = getDb()
-    const workspace = await db
-      .selectFrom('workspaces')
-      .select('team_id')
-      .where('id', '=', request.params.id)
-      .executeTakeFirst()
+    const workspace = await prisma.workspace.findFirst({
+      where: { id: request.params.id },
+      select: { team_id: true },
+    })
 
-    if (!workspace) {
+    if (!workspace?.team_id) {
       return reply.notFound('Workspace not found')
     }
 
-    const membership = await db
-      .selectFrom('team_members')
-      .select('role')
-      .where('team_id', '=', workspace.team_id)
-      .where('user_id', '=', request.user.id)
-      .executeTakeFirst()
+    const membership = await prisma.teamMember.findFirst({
+      where: { team_id: workspace.team_id, user_id: request.user.id },
+      select: { role: true },
+    })
 
     if (!membership || (TEAM_ROLE_RANK[membership.role] ?? -1) < TEAM_ROLE_RANK['owner']) {
       return reply.status(403).send({
@@ -85,13 +77,10 @@ export function workspaceGuard(requiredRole: string) {
   return async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
     if (request.user.role === 'admin') return
 
-    const db = getDb()
-    const membership = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', request.params.id)
-      .where('user_id', '=', request.user.id)
-      .executeTakeFirst()
+    const membership = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: request.params.id, user_id: request.user.id },
+      select: { role: true },
+    })
 
     if (!membership) {
       return reply.status(403).send({

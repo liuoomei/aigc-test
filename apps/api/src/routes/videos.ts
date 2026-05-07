@@ -4,8 +4,7 @@ import { unlink, mkdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { pipeline } from 'node:stream/promises'
-import { getDb } from '@aigc/db'
-import { sql } from 'kysely'
+import { prisma } from '../lib/prisma.js'
 import { freezeCredits, refundCredits } from '../services/credit.js'
 import { VIDEO_CREDITS_MAP } from '../lib/credits.js'
 import { encryptProxyUrl } from '../lib/storage.js'
@@ -47,6 +46,7 @@ interface VideoGenerateBody {
   idempotency_key?: string
   canvas_id?: string
   canvas_node_id?: string
+  video_studio_project_id?: string
   model?: string
   images?: string[]            // 首尾帧（首尾帧 Tab）
   reference_images?: string[]  // 参考图（参考生视频 Tab / multimodal Tab，Seedance 2.0 专用）
@@ -297,17 +297,16 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
       : VIDEO_CREDITS_MAP[model] ?? 10
 
     const userId = request.user.id
-    const db = getDb()
 
     // Check pending batch limit
-    const pendingCount = await db
-      .selectFrom('task_batches')
-      .select(db.fn.count('id').as('count'))
-      .where('user_id', '=', userId)
-      .where('status', 'in', ['pending', 'processing'])
-      .executeTakeFirstOrThrow()
+    const pendingCount = await prisma.taskBatch.count({
+      where: {
+        user_id: userId,
+        status: { in: ['pending', 'processing'] },
+      },
+    })
 
-    if (Number(pendingCount.count) >= 20) {
+    if (pendingCount >= 20) {
       return reply.status(429).send({
         success: false,
         error: { code: 'TOO_MANY_PENDING', message: '当前任务队列已满，请等待已有视频生成完成后再提交' },
@@ -315,13 +314,15 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Verify workspace membership
-    const wsMember = await db
-      .selectFrom('workspace_members')
-      .innerJoin('workspaces', 'workspaces.id', 'workspace_members.workspace_id')
-      .select(['workspaces.team_id', 'workspace_members.role'])
-      .where('workspace_members.workspace_id', '=', workspaceId)
-      .where('workspace_members.user_id', '=', userId)
-      .executeTakeFirst()
+    const wsMember = await prisma.workspaceMember.findFirst({
+      where: {
+        workspace_id: workspaceId,
+        user_id: userId,
+      },
+      include: {
+        workspace: { select: { team_id: true } },
+      },
+    })
 
     if (!wsMember && request.user.role !== 'admin') {
       return reply.status(403).send({
@@ -338,25 +339,29 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
 
     let teamId: string
     if (wsMember) {
-      teamId = wsMember.team_id
+      if (!wsMember.workspace.team_id) {
+        return reply.status(400).send({ success: false, error: { code: 'NO_TEAM', message: '工作区未关联团队' } })
+      }
+      teamId = wsMember.workspace.team_id
     } else {
-      const workspace = await db
-        .selectFrom('workspaces')
-        .select('team_id')
-        .where('id', '=', workspaceId)
-        .executeTakeFirst()
+      const workspace = await prisma.workspace.findUnique({
+        where: { id: workspaceId },
+        select: { team_id: true },
+      })
       if (!workspace) {
         return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '工作区未找到' } })
+      }
+      if (!workspace.team_id) {
+        return reply.status(400).send({ success: false, error: { code: 'NO_TEAM', message: '工作区未关联团队' } })
       }
       teamId = workspace.team_id
     }
 
-    const teamMember = await db
-      .selectFrom('team_members')
-      .select('user_id')
-      .where('team_id', '=', teamId)
-      .where('user_id', '=', userId)
-      .executeTakeFirst()
+    const teamMember = await prisma.teamMember.findUnique({
+      where: {
+        team_id_user_id: { team_id: teamId, user_id: userId },
+      },
+    })
 
     if (!teamMember) {
       return reply.status(403).send({
@@ -367,20 +372,18 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
 
     // Idempotency: if caller retries with same key, return existing batch directly
     if (idempotencyKey) {
-      const existing = await db
-        .selectFrom('task_batches')
-        .selectAll()
-        .where('idempotency_key', '=', idempotencyKey)
-        .where('user_id', '=', userId)
-        .where('module', '=', 'video')
-        .executeTakeFirst()
+      const existing = await prisma.taskBatch.findFirst({
+        where: {
+          idempotency_key: idempotencyKey,
+          user_id: userId,
+          module: 'video',
+        },
+      })
 
       if (existing) {
-        const tasks = await db
-          .selectFrom('tasks')
-          .selectAll()
-          .where('batch_id', '=', existing.id)
-          .execute()
+        const tasks = await prisma.task.findMany({
+          where: { batch_id: existing.id },
+        })
 
         return reply.send({
           id: existing.id,
@@ -396,7 +399,7 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
           estimated_credits: existing.estimated_credits,
           actual_credits: existing.actual_credits,
           created_at: String(existing.created_at),
-          tasks: tasks.map((t: any) => ({
+          tasks: tasks.map((t) => ({
             id: t.id,
             version_index: t.version_index,
             status: t.status,
@@ -429,7 +432,7 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
     let batchId: string
     let taskId: string
     try {
-    const _batchTask = await db.transaction().execute(async (trx: any) => {
+    const _batchTask = await prisma.$transaction(async (tx) => {
       const paramsForDb: Record<string, unknown> = {
         aspect_ratio: aspect_ratio ?? null,
         resolution: resolution ?? null,
@@ -464,9 +467,8 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
 
       const provider = isSeedance ? 'volcengine' : 'nano-banana'
 
-      const batchResult = await trx
-        .insertInto('task_batches')
-        .values({
+      const batchResult = await tx.taskBatch.create({
+        data: {
           idempotency_key: idempotencyKey ?? randomUUID(),
           user_id: userId,
           team_id: teamId,
@@ -482,22 +484,21 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
           estimated_credits: VIDEO_CREDITS,
           ...(canvasId ? { canvas_id: canvasId, canvas_node_id: canvasNodeId ?? null } : {}),
           ...(videoStudioProjectId ? { video_studio_project_id: videoStudioProjectId } : {}),
-        })
-        .returning('id')
-        .executeTakeFirstOrThrow()
+        },
+        select: { id: true },
+      })
 
-      const taskResult = await trx
-        .insertInto('tasks')
-        .values({
+      const taskResult = await tx.task.create({
+        data: {
           batch_id: batchResult.id,
           user_id: userId,
           version_index: 0,
           estimated_credits: VIDEO_CREDITS,
           status: 'processing',
           processing_started_at: new Date().toISOString(),
-        })
-        .returning('id')
-        .executeTakeFirstOrThrow()
+        },
+        select: { id: true },
+      })
 
       return { batchId: batchResult.id, taskId: taskResult.id }
     })
@@ -711,32 +712,49 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
 
     // If no externalTaskId, fail the task and refund credits
     if (!externalTaskId!) {
-      await db.transaction().execute(async (trx: any) => {
-        await trx.updateTable('tasks')
-          .set({ status: 'failed', error_message: lastError.slice(0, 1000), completed_at: new Date().toISOString() })
-          .where('id', '=', taskId).execute()
+      await prisma.$transaction(async (tx) => {
+        await tx.task.update({
+          where: { id: taskId },
+          data: {
+            status: 'failed',
+            error_message: lastError.slice(0, 1000),
+            completed_at: new Date(),
+          },
+        })
 
-        await trx.updateTable('task_batches')
-          .set({ status: 'failed', failed_count: sql`failed_count + 1` })
-          .where('id', '=', batchId).execute()
+        await tx.taskBatch.update({
+          where: { id: batchId },
+          data: {
+            status: 'failed',
+            failed_count: { increment: 1 },
+          },
+        })
 
-        await trx.updateTable('credit_accounts')
-          .set({ frozen_credits: sql`frozen_credits - ${VIDEO_CREDITS}` })
-          .where('id', '=', creditAccountId).execute()
+        await tx.creditAccount.update({
+          where: { id: creditAccountId },
+          data: {
+            frozen_credits: { decrement: VIDEO_CREDITS },
+          },
+        })
 
-        await trx.updateTable('team_members')
-          .set({ credit_used: sql`GREATEST(credit_used - ${VIDEO_CREDITS}, 0)` })
-          .where('team_id', '=', teamId).where('user_id', '=', userId).execute()
+        await tx.teamMember.update({
+          where: { team_id_user_id: { team_id: teamId, user_id: userId } },
+          data: {
+            credit_used: { decrement: VIDEO_CREDITS },
+          },
+        })
 
-        await trx.insertInto('credits_ledger').values({
-          credit_account_id: creditAccountId,
-          user_id: userId,
-          amount: VIDEO_CREDITS,
-          type: 'refund',
-          task_id: taskId,
-          batch_id: batchId,
-          description: `Video generation failed to submit: ${lastError.slice(0, 200)}`,
-        }).execute()
+        await tx.creditsLedger.create({
+          data: {
+            credit_account_id: creditAccountId,
+            user_id: userId,
+            amount: VIDEO_CREDITS,
+            type: 'refund',
+            task_id: taskId,
+            batch_id: batchId,
+            description: `Video generation failed to submit: ${lastError.slice(0, 200)}`,
+          },
+        })
       })
 
       try {
@@ -750,10 +768,10 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Update task with external_task_id
-    await db.updateTable('tasks')
-      .set({ external_task_id: externalTaskId })
-      .where('id', '=', taskId)
-      .execute()
+    await prisma.task.update({
+      where: { id: taskId },
+      data: { external_task_id: externalTaskId },
+    })
 
     return reply.status(201).send({
       id: batchId,
@@ -787,14 +805,11 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
   app.delete<{ Params: { batchId: string } }>('/videos/batches/:batchId/cancel', async (request, reply) => {
     const { batchId } = request.params
     const userId = request.user.id
-    const db = getDb()
 
-    const batch = await db
-      .selectFrom('task_batches')
-      .select(['id', 'user_id', 'provider', 'status', 'team_id', 'credit_account_id'])
-      .where('id', '=', batchId)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const batch = await prisma.taskBatch.findUnique({
+      where: { id: batchId },
+      select: { id: true, user_id: true, provider: true, status: true, team_id: true, credit_account_id: true },
+    })
 
     if (!batch) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '任务不存在' } })
     if (batch.user_id !== userId && request.user.role !== 'admin') {
@@ -807,12 +822,13 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ success: false, error: { code: 'INVALID_STATE', message: '任务已完成或已取消，无法取消' } })
     }
 
-    const task = await db
-      .selectFrom('tasks')
-      .select(['id', 'external_task_id', 'estimated_credits', 'status'])
-      .where('batch_id', '=', batchId)
-      .where('status', 'in', ['processing', 'pending'])
-      .executeTakeFirst()
+    const task = await prisma.task.findFirst({
+      where: {
+        batch_id: batchId,
+        status: { in: ['processing', 'pending'] },
+      },
+      select: { id: true, external_task_id: true, estimated_credits: true, status: true },
+    })
 
     if (!task) return reply.status(400).send({ success: false, error: { code: 'INVALID_STATE', message: '任务已完成或已取消，无法取消' } })
 
@@ -829,37 +845,60 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Mark task/batch as failed and refund credits
-    await db.transaction().execute(async (trx: any) => {
-      const updated = await trx
-        .updateTable('tasks')
-        .set({ status: 'failed', error_message: '用户已取消', completed_at: new Date().toISOString() })
-        .where('id', '=', task.id)
-        .where('status', 'in', ['processing', 'pending'])
-        .execute()
+    await prisma.$transaction(async (tx) => {
+      const updated = await tx.task.updateMany({
+        where: {
+          id: task.id,
+          status: { in: ['processing', 'pending'] },
+        },
+        data: {
+          status: 'failed',
+          error_message: '用户已取消',
+          completed_at: new Date(),
+        },
+      })
 
-      if (Number((updated as any)[0]?.numUpdatedRows ?? (updated as any).numUpdatedRows ?? 0) === 0) return
+      if (updated.count === 0) return
 
-      await trx.updateTable('task_batches')
-        .set({ status: 'failed', failed_count: sql`failed_count + 1` })
-        .where('id', '=', batchId).execute()
+      await tx.taskBatch.update({
+        where: { id: batchId },
+        data: {
+          status: 'failed',
+          failed_count: { increment: 1 },
+        },
+      })
 
-      await trx.updateTable('credit_accounts')
-        .set({ frozen_credits: sql`frozen_credits - ${task.estimated_credits}` })
-        .where('id', '=', batch.credit_account_id).execute()
+      if (batch.credit_account_id) {
+        await tx.creditAccount.update({
+          where: { id: batch.credit_account_id },
+          data: {
+            frozen_credits: { decrement: task.estimated_credits },
+          },
+        })
+      }
 
-      await trx.updateTable('team_members')
-        .set({ credit_used: sql`GREATEST(credit_used - ${task.estimated_credits}, 0)` })
-        .where('team_id', '=', batch.team_id).where('user_id', '=', userId).execute()
+      if (batch.team_id) {
+        await tx.teamMember.update({
+          where: { team_id_user_id: { team_id: batch.team_id, user_id: userId } },
+          data: {
+            credit_used: { decrement: task.estimated_credits },
+          },
+        })
+      }
 
-      await trx.insertInto('credits_ledger').values({
-        credit_account_id: batch.credit_account_id,
-        user_id: userId,
-        amount: task.estimated_credits,
-        type: 'refund',
-        task_id: task.id,
-        batch_id: batchId,
-        description: '用户取消视频生成',
-      }).execute()
+      if (batch.credit_account_id) {
+        await tx.creditsLedger.create({
+          data: {
+            credit_account_id: batch.credit_account_id,
+            user_id: userId,
+            amount: task.estimated_credits,
+            type: 'refund',
+            task_id: task.id,
+            batch_id: batchId,
+            description: '用户取消视频生成',
+          },
+        })
+      }
     })
 
     try {
@@ -884,19 +923,20 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const jobId = randomUUID()
-    const db = getDb()
 
-    await db.insertInto('concat_jobs' as any).values({
-      id: jobId,
-      status: 'processing',
-      created_at: new Date(),
-      updated_at: new Date(),
-    }).execute()
+    await prisma.concatJob.create({
+      data: {
+        id: jobId,
+        status: 'processing',
+        created_at: new Date(),
+        updated_at: new Date(),
+      },
+    })
 
     concatJobStore.set(jobId, { status: 'processing' })
 
     // fire-and-forget
-    runConcatExport(jobId, segments, projectName ?? 'export', concatJobStore, db).catch((err) => {
+    runConcatExport(jobId, segments, projectName ?? 'export', concatJobStore, prisma).catch((err) => {
       app.log.error({ err, jobId }, 'concat-export failed')
     })
 
@@ -912,13 +952,12 @@ export async function videoRoutes(app: FastifyInstance): Promise<void> {
     const mem = concatJobStore.get(jobId)
     if (mem) return reply.send(mem)
 
-    const db = getDb()
-    const row = await db.selectFrom('concat_jobs' as any)
-      .selectAll()
-      .where('id', '=', jobId)
-      .executeTakeFirst()
+    const row = await prisma.concatJob.findUnique({
+      where: { id: jobId },
+      select: { status: true, result_url: true, error: true },
+    })
 
     if (!row) return reply.status(404).send({ error: 'not found' })
-    return reply.send({ status: (row as any).status, resultUrl: (row as any).result_url, error: (row as any).error })
+    return reply.send({ status: row.status, resultUrl: row.result_url, error: row.error })
   })
 }

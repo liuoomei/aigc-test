@@ -1,15 +1,14 @@
 import type { FastifyInstance } from 'fastify'
-import { getDb } from '@aigc/db'
-import type Redis from 'ioredis'
+import { prisma } from '../lib/prisma.js'
+import type { Redis } from 'ioredis'
 
 export async function healthzRoutes(app: FastifyInstance): Promise<void> {
   app.get('/healthz', async (_request, reply) => {
-    const db = getDb()
     const redis: Redis = (app as unknown as { redis: Redis }).redis
 
     let dbStatus = 'ok'
     try {
-      await db.selectFrom('users').select('id').limit(1).execute()
+      await prisma.user.findFirst({ select: { id: true } })
     } catch {
       dbStatus = 'error'
     }

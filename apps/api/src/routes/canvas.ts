@@ -2,8 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import { createWriteStream, createReadStream } from 'node:fs'
 import { unlink, mkdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import { getDb } from '@aigc/db'
-import { sql } from 'kysely'
+import { prisma } from '../lib/prisma.js'
 import { signAssetUrl, signAssetUrls, uploadToS3 } from '../lib/storage.js'
 import { purgeCanvasProject, restoreProjectAssets, softDeleteProjectAssets } from '../lib/project-purge.js'
 import { randomUUID } from 'node:crypto'
@@ -13,15 +12,13 @@ const CANVAS_UPLOAD_DIR = '/tmp/canvas-uploads'
 const CANVAS_UPLOAD_MAX_AGE_MS = 10 * 60 * 1000 // 10 min — enough for external storage to fetch
 const SAFE_CANVAS_ID = /^[\w-]+\.(jpg|jpeg|png|webp|gif|mp4|mov|webm)$/
 
-async function assertCanvasEnabledForWorkspace(db: ReturnType<typeof getDb>, workspaceId: string) {
-  const workspace = await db
-    .selectFrom('workspaces')
-    .innerJoin('teams', 'teams.id', 'workspaces.team_id')
-    .select('teams.team_type')
-    .where('workspaces.id', '=', workspaceId)
-    .executeTakeFirst()
+async function assertCanvasEnabledForWorkspace(workspaceId: string) {
+  const workspace = await prisma.workspace.findFirst({
+    where: { id: workspaceId },
+    include: { team: { select: { team_type: true } } },
+  })
 
-  if (!workspace || workspace.team_type !== 'avatar_enabled') {
+  if (!workspace || workspace.team?.team_type !== 'avatar_enabled') {
     throw new Error('CANVAS_DISABLED')
   }
 }
@@ -104,21 +101,21 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
 
   // GET /canvases — list user's canvases, optionally filtered by workspace_id
   app.get<{ Querystring: { workspace_id?: string } }>('/canvases', async (request, reply) => {
-    const db = getDb()
     const userId = request.user.id
     const filterWsId = (request.query as any).workspace_id as string | undefined
 
     // Get all workspace IDs the user belongs to and that have canvas enabled
-    const memberships = await db
-      .selectFrom('workspace_members')
-      .innerJoin('workspaces', 'workspaces.id', 'workspace_members.workspace_id')
-      .innerJoin('teams', 'teams.id', 'workspaces.team_id')
-      .select('workspace_members.workspace_id')
-      .where('workspace_members.user_id', '=', userId)
-      .where('teams.team_type', '=', 'avatar_enabled')
-      .execute()
+    const memberships = await prisma.workspaceMember.findMany({
+      where: {
+        user_id: userId,
+        workspace: {
+          team: { team_type: 'avatar_enabled' },
+        },
+      },
+      select: { workspace_id: true },
+    })
 
-    const wsIds = memberships.map((m: any) => m.workspace_id)
+    const wsIds = memberships.map((m) => m.workspace_id)
     if (wsIds.length === 0) return reply.send([])
 
     // If workspace_id filter provided, verify membership then narrow
@@ -127,13 +124,14 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
       : wsIds
     if (targetWsIds.length === 0) return reply.send([])
 
-    const canvases = await db
-      .selectFrom('canvases')
-      .select(['id', 'name', 'thumbnail_url', 'created_at', 'updated_at'])
-      .where('workspace_id', 'in', targetWsIds)
-      .where('is_deleted', '=', false)
-      .orderBy('updated_at', 'desc')
-      .execute()
+    const canvases = await prisma.canvas.findMany({
+      where: {
+        workspace_id: { in: targetWsIds },
+        is_deleted: false,
+      },
+      select: { id: true, name: true, thumbnail_url: true, created_at: true, updated_at: true },
+      orderBy: { updated_at: 'desc' },
+    })
 
     // For canvases with a thumbnail_url, use it directly.
     // Only query canvas_node_outputs for canvases that have no thumbnail yet.
@@ -144,12 +142,11 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
 
     if (canvasesNeedPreview.length > 0) {
       const needIds = canvasesNeedPreview.map((c) => c.id)
-      const rows = await db
-        .selectFrom('canvas_node_outputs')
-        .select(['canvas_id', 'output_urls'])
-        .where('canvas_id', 'in', needIds)
-        .orderBy('created_at', 'desc')
-        .execute()
+      const rows = await prisma.canvasNodeOutput.findMany({
+        where: { canvas_id: { in: needIds } },
+        select: { canvas_id: true, output_urls: true },
+        orderBy: { created_at: 'desc' },
+      })
 
       for (const row of rows) {
         const cid = row.canvas_id as string
@@ -181,20 +178,17 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
 
   // POST /canvases — create new canvas
   app.post<{ Body: { name?: string; workspace_id?: string } }>('/canvases', async (request, reply) => {
-    const db = getDb()
     const userId = request.user.id
     const { name = '未命名画布', workspace_id } = request.body ?? {}
 
     // Resolve workspace: use provided or pick first membership
     let wsId = workspace_id
     if (!wsId) {
-      const membership = await db
-        .selectFrom('workspace_members')
-        .select('workspace_id')
-        .where('user_id', '=', userId)
-        .orderBy('created_at', 'asc')
-        .limit(1)
-        .executeTakeFirst()
+      const membership = await prisma.workspaceMember.findFirst({
+        where: { user_id: userId },
+        orderBy: { created_at: 'asc' },
+        select: { workspace_id: true },
+      })
       if (!membership) {
         return reply.status(400).send({ success: false, error: { code: 'NO_WORKSPACE', message: '用户没有可用的工作空间' } })
       }
@@ -202,59 +196,49 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Verify membership
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', wsId)
-      .where('user_id', '=', userId)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: wsId, user_id: userId },
+      select: { role: true },
+    })
     if (!member) {
       return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权访问该工作空间' } })
     }
 
     try {
-      await assertCanvasEnabledForWorkspace(db, wsId)
+      await assertCanvasEnabledForWorkspace(wsId)
     } catch {
       return reply.status(403).send({ success: false, error: { code: 'CANVAS_DISABLED', message: '当前团队未开通画布能力' } })
     }
 
-    const canvas = await db
-      .insertInto('canvases')
-      .values({
+    const canvas = await prisma.canvas.create({
+      data: {
         workspace_id: wsId,
         user_id: userId,
         name,
-        structure_data: JSON.stringify({ nodes: [], edges: [] }),
-      })
-      .returningAll()
-      .executeTakeFirstOrThrow()
+        structure_data: { nodes: [], edges: [] },
+      },
+    })
 
     return reply.status(201).send(canvas)
   })
 
   // GET /canvases/:id — load canvas with structure_data
   app.get<{ Params: { id: string } }>('/canvases/:id', async (request, reply) => {
-    const db = getDb()
-    const canvas = await db
-      .selectFrom('canvases')
-      .selectAll()
-      .where('id', '=', request.params.id)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const canvas = await prisma.canvas.findFirst({
+      where: { id: request.params.id, is_deleted: false },
+    })
 
     if (!canvas) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '画布不存在' } })
 
     // Auth: must be workspace member
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', canvas.workspace_id)
-      .where('user_id', '=', request.user.id)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: canvas.workspace_id, user_id: request.user.id },
+      select: { role: true },
+    })
     if (!member) return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权访问该画布' } })
 
     try {
-      await assertCanvasEnabledForWorkspace(db, canvas.workspace_id)
+      await assertCanvasEnabledForWorkspace(canvas.workspace_id)
     } catch {
       return reply.status(403).send({ success: false, error: { code: 'CANVAS_DISABLED', message: '当前团队未开通画布能力' } })
     }
@@ -267,7 +251,6 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
     Params: { id: string }
     Body: { name?: string; structure_data?: any; version: number; thumbnail_url?: string }
   }>('/canvases/:id', async (request, reply) => {
-    const db = getDb()
     const { id } = request.params
     const { name, structure_data, version, thumbnail_url } = request.body
 
@@ -279,176 +262,164 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    const canvas = await db
-      .selectFrom('canvases')
-      .select(['workspace_id', 'version'])
-      .where('id', '=', id)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const canvas = await prisma.canvas.findFirst({
+      where: { id, is_deleted: false },
+      select: { workspace_id: true, version: true },
+    })
     if (!canvas) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '画布不存在' } })
 
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', canvas.workspace_id)
-      .where('user_id', '=', request.user.id)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: canvas.workspace_id, user_id: request.user.id },
+      select: { role: true },
+    })
     if (!member) return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权修改该画布' } })
 
     try {
-      await assertCanvasEnabledForWorkspace(db, canvas.workspace_id)
+      await assertCanvasEnabledForWorkspace(canvas.workspace_id)
     } catch {
       return reply.status(403).send({ success: false, error: { code: 'CANVAS_DISABLED', message: '当前团队未开通画布能力' } })
     }
 
     // Optimistic lock
-    let query = db.updateTable('canvases')
-      .set({
-        version: sql`version + 1`,
-        updated_at: sql`now()`,
+    const updated = await prisma.canvas.updateMany({
+      where: { id, version },
+      data: {
+        version: { increment: 1 },
+        updated_at: new Date(),
         ...(name !== undefined ? { name } : {}),
-        ...(structure_data !== undefined ? { structure_data: JSON.stringify(structure_data) } : {}),
+        ...(structure_data !== undefined ? { structure_data } : {}),
         ...(thumbnail_url !== undefined ? { thumbnail_url } : {}),
-      })
-      .where('id', '=', id)
-      .where('version', '=', version)
-      .returning(['id', 'version'])
+      },
+    })
 
-    const updated = await query.executeTakeFirst()
-    if (!updated) {
+    if (updated.count === 0) {
       return reply.status(409).send({ success: false, error: { code: 'CONFLICT', message: '画布已被其他设备修改，请刷新后重试' } })
     }
 
-    return reply.send({ id: updated.id, version: updated.version })
+    const fresh = await prisma.canvas.findFirst({
+      where: { id },
+      select: { id: true, version: true },
+    })
+
+    return reply.send({ id: fresh!.id, version: fresh!.version })
   })
 
   // DELETE /canvases/:id
   app.delete<{ Params: { id: string } }>('/canvases/:id', async (request, reply) => {
-    const db = getDb()
-    const canvas = await db
-      .selectFrom('canvases')
-      .select(['workspace_id', 'user_id'])
-      .where('id', '=', request.params.id)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const canvas = await prisma.canvas.findFirst({
+      where: { id: request.params.id, is_deleted: false },
+      select: { workspace_id: true, user_id: true },
+    })
     if (!canvas) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '画布不存在' } })
 
     // Only creator or workspace admin can delete
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', canvas.workspace_id)
-      .where('user_id', '=', request.user.id)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: canvas.workspace_id, user_id: request.user.id },
+      select: { role: true },
+    })
     if (!member || (canvas.user_id !== request.user.id && member.role !== 'admin')) {
       return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权删除该画布' } })
     }
 
     try {
-      await assertCanvasEnabledForWorkspace(db, canvas.workspace_id)
+      await assertCanvasEnabledForWorkspace(canvas.workspace_id)
     } catch {
       return reply.status(403).send({ success: false, error: { code: 'CANVAS_DISABLED', message: '当前团队未开通画布能力' } })
     }
 
-    await db.transaction().execute(async (trx) => {
-      await trx
-        .updateTable('canvases')
-        .set({ is_deleted: true, deleted_at: sql`now()`, updated_at: sql`now()` })
-        .where('id', '=', request.params.id)
-        .execute()
-      await softDeleteProjectAssets(trx, 'canvas_id', request.params.id)
-    })
+    await prisma.$transaction([
+      prisma.canvas.update({
+        where: { id: request.params.id },
+        data: { is_deleted: true, deleted_at: new Date(), updated_at: new Date() },
+      }),
+    ])
+    await softDeleteProjectAssets('canvas_id', request.params.id)
     return reply.send({ success: true })
   })
 
   // GET /canvases/trash — list deleted canvases
   app.get<{ Querystring: { workspace_id?: string } }>('/canvases/trash', async (request, reply) => {
-    const db = getDb()
     const userId = request.user.id
     const filterWsId = request.query.workspace_id
 
-    const memberships = await db
-      .selectFrom('workspace_members')
-      .innerJoin('workspaces', 'workspaces.id', 'workspace_members.workspace_id')
-      .innerJoin('teams', 'teams.id', 'workspaces.team_id')
-      .select(['workspace_members.workspace_id', 'workspace_members.role'])
-      .where('workspace_members.user_id', '=', userId)
-      .where('teams.team_type', '=', 'avatar_enabled')
-      .execute()
+    const memberships = await prisma.workspaceMember.findMany({
+      where: {
+        user_id: userId,
+        workspace: {
+          team: { team_type: 'avatar_enabled' },
+        },
+      },
+      select: { workspace_id: true, role: true },
+    })
 
     const targetWsIds = memberships.map((m) => m.workspace_id).filter((id) => !filterWsId || id === filterWsId)
     if (targetWsIds.length === 0) return reply.send([])
 
-    const canvases = await db
-      .selectFrom('canvases')
-      .select(['id', 'name', 'thumbnail_url', 'created_at', 'updated_at', 'deleted_at', 'user_id', 'workspace_id'])
-      .where('workspace_id', 'in', targetWsIds)
-      .where('is_deleted', '=', true)
-      .where((eb) => eb.or([
-        eb('user_id', '=', userId),
-        eb('workspace_id', 'in', memberships.filter((m) => m.role === 'admin').map((m) => m.workspace_id)),
-      ]))
-      .orderBy('deleted_at', 'desc')
-      .execute()
+    const adminWsIds = memberships.filter((m) => m.role === 'admin').map((m) => m.workspace_id)
+
+    const canvases = await prisma.canvas.findMany({
+      where: {
+        workspace_id: { in: targetWsIds },
+        is_deleted: true,
+        OR: [
+          { user_id: userId },
+          { workspace_id: { in: adminWsIds } },
+        ],
+      },
+      select: {
+        id: true, name: true, thumbnail_url: true, created_at: true,
+        updated_at: true, deleted_at: true, user_id: true, workspace_id: true,
+      },
+      orderBy: { deleted_at: 'desc' },
+    })
 
     return reply.send(canvases)
   })
 
   // POST /canvases/:id/restore
   app.post<{ Params: { id: string } }>('/canvases/:id/restore', async (request, reply) => {
-    const db = getDb()
-    const canvas = await db
-      .selectFrom('canvases')
-      .select(['workspace_id', 'user_id'])
-      .where('id', '=', request.params.id)
-      .where('is_deleted', '=', true)
-      .executeTakeFirst()
+    const canvas = await prisma.canvas.findFirst({
+      where: { id: request.params.id, is_deleted: true },
+      select: { workspace_id: true, user_id: true },
+    })
     if (!canvas) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '画布不存在' } })
 
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', canvas.workspace_id)
-      .where('user_id', '=', request.user.id)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: canvas.workspace_id, user_id: request.user.id },
+      select: { role: true },
+    })
     if (!member || (canvas.user_id !== request.user.id && member.role !== 'admin')) {
       return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权恢复该画布' } })
     }
 
-    await db.transaction().execute(async (trx) => {
-      await trx
-        .updateTable('canvases')
-        .set({ is_deleted: false, deleted_at: null, updated_at: sql`now()` })
-        .where('id', '=', request.params.id)
-        .execute()
-      await restoreProjectAssets(trx, 'canvas_id', request.params.id)
-    })
+    await prisma.$transaction([
+      prisma.canvas.update({
+        where: { id: request.params.id },
+        data: { is_deleted: false, deleted_at: null, updated_at: new Date() },
+      }),
+    ])
+    await restoreProjectAssets('canvas_id', request.params.id)
 
     return reply.send({ success: true })
   })
 
   // DELETE /canvases/:id/permanent
   app.delete<{ Params: { id: string } }>('/canvases/:id/permanent', async (request, reply) => {
-    const db = getDb()
-    const canvas = await db
-      .selectFrom('canvases')
-      .select(['workspace_id', 'user_id'])
-      .where('id', '=', request.params.id)
-      .where('is_deleted', '=', true)
-      .executeTakeFirst()
+    const canvas = await prisma.canvas.findFirst({
+      where: { id: request.params.id, is_deleted: true },
+      select: { workspace_id: true, user_id: true },
+    })
     if (!canvas) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '画布不存在' } })
 
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', canvas.workspace_id)
-      .where('user_id', '=', request.user.id)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: canvas.workspace_id, user_id: request.user.id },
+      select: { role: true },
+    })
     if (!member || (canvas.user_id !== request.user.id && member.role !== 'admin')) {
       return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权永久删除该画布' } })
     }
 
-    await purgeCanvasProject(db, request.params.id)
+    await purgeCanvasProject(prisma, request.params.id)
     return reply.send({ success: true })
   })
 
@@ -461,27 +432,22 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
       },
     },
   }, async (request, reply) => {
-    const db = getDb()
     const { id } = request.params
 
-    const canvas = await db
-      .selectFrom('canvases')
-      .select('workspace_id')
-      .where('id', '=', id)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const canvas = await prisma.canvas.findFirst({
+      where: { id, is_deleted: false },
+      select: { workspace_id: true },
+    })
     if (!canvas) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '画布不存在' } })
 
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', canvas.workspace_id)
-      .where('user_id', '=', request.user.id)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: canvas.workspace_id, user_id: request.user.id },
+      select: { role: true },
+    })
     if (!member) return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权访问该画布' } })
 
     try {
-      await assertCanvasEnabledForWorkspace(db, canvas.workspace_id)
+      await assertCanvasEnabledForWorkspace(canvas.workspace_id)
     } catch {
       return reply.status(403).send({ success: false, error: { code: 'CANVAS_DISABLED', message: '当前团队未开通画布能力' } })
     }
@@ -496,31 +462,34 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Fetch active batches for this canvas
-    const activeRows = await db
-      .selectFrom('task_batches')
-      .select(['id', 'canvas_node_id', 'status', 'quantity', 'completed_count', 'failed_count', 'provider', 'created_at'])
-      .where('canvas_id', '=', id)
-      .where('status', 'in', ['pending', 'processing'])
-      .execute()
+    const activeRows = await prisma.taskBatch.findMany({
+      where: {
+        canvas_id: id,
+        status: { in: ['pending', 'processing'] },
+        is_deleted: false,
+      },
+      select: {
+        id: true, canvas_node_id: true, status: true, quantity: true,
+        completed_count: true, failed_count: true, provider: true, created_at: true,
+      },
+    })
 
-    const batches = await Promise.all(activeRows.map(async (batch: any) => {
+    const batches = await Promise.all(activeRows.map(async (batch) => {
       const queuePosition = batch.status === 'pending'
-        ? Number((await db
-            .selectFrom('task_batches')
-            .select((eb: any) => eb.fn.countAll().as('count'))
-            .where('is_deleted', '=', false)
-            .where('status', '=', 'pending')
-            .where('provider', '=', batch.provider)
-            .where('created_at', '<', batch.created_at)
-            .executeTakeFirst() as any)?.count ?? 0)
+        ? await prisma.taskBatch.count({
+            where: {
+              is_deleted: false,
+              status: 'pending',
+              provider: batch.provider,
+              created_at: { lt: batch.created_at },
+            },
+          })
         : null
-      const processing = await db
-        .selectFrom('tasks')
-        .select('processing_started_at')
-        .where('batch_id', '=', batch.id)
-        .where('processing_started_at', 'is not', null)
-        .orderBy('processing_started_at', 'asc')
-        .executeTakeFirst()
+      const processing = await prisma.task.findFirst({
+        where: { batch_id: batch.id, processing_started_at: { not: null } },
+        select: { processing_started_at: true },
+        orderBy: { processing_started_at: 'asc' },
+      })
       return {
         id: batch.id,
         canvas_node_id: batch.canvas_node_id,
@@ -540,36 +509,31 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { id: string; nodeId: string }; Body: { output_urls: string[]; is_selected?: boolean } }>(
     '/canvases/:id/node-outputs/:nodeId',
     async (request, reply) => {
-      const db = getDb()
       const { id, nodeId } = request.params
       const { output_urls, is_selected = true } = request.body
 
-      const canvas = await db
-        .selectFrom('canvases')
-        .select('workspace_id')
-        .where('id', '=', id)
-        .executeTakeFirst()
+      const canvas = await prisma.canvas.findFirst({
+        where: { id },
+        select: { workspace_id: true },
+      })
       if (!canvas) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '画布不存在' } })
 
-      const member = await db
-        .selectFrom('workspace_members')
-        .select('role')
-        .where('workspace_id', '=', canvas.workspace_id)
-        .where('user_id', '=', request.user.id)
-        .executeTakeFirst()
+      const member = await prisma.workspaceMember.findFirst({
+        where: { workspace_id: canvas.workspace_id, user_id: request.user.id },
+        select: { role: true },
+      })
       if (!member) return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权访问该画布' } })
 
-      const urlsLiteral = output_urls.map((u) => `'${u.replace(/'/g, "''")}'`).join(',')
-      const row = await db
-        .insertInto('canvas_node_outputs')
-        .values({
+      const row = await prisma.canvasNodeOutput.create({
+        data: {
           canvas_id: id,
           node_id: nodeId,
-          output_urls: sql.raw(`ARRAY[${urlsLiteral}]::text[]`),
+          user_id: request.user.id,
+          output_urls,
           is_selected,
-        })
-        .returning('id')
-        .executeTakeFirstOrThrow()
+        },
+        select: { id: true },
+      })
 
       return reply.status(201).send({ id: row.id })
     }
@@ -584,51 +548,46 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
       },
     },
   }, async (request, reply) => {
-    const db = getDb()
     const { id, nodeId } = request.params
 
-    const canvas = await db
-      .selectFrom('canvases')
-      .select('workspace_id')
-      .where('id', '=', id)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const canvas = await prisma.canvas.findFirst({
+      where: { id, is_deleted: false },
+      select: { workspace_id: true },
+    })
     if (!canvas) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '画布不存在' } })
 
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', canvas.workspace_id)
-      .where('user_id', '=', request.user.id)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: canvas.workspace_id, user_id: request.user.id },
+      select: { role: true },
+    })
     if (!member) return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权访问该画布' } })
 
     try {
-      await assertCanvasEnabledForWorkspace(db, canvas.workspace_id)
+      await assertCanvasEnabledForWorkspace(canvas.workspace_id)
     } catch {
       return reply.status(403).send({ success: false, error: { code: 'CANVAS_DISABLED', message: '当前团队未开通画布能力' } })
     }
 
-    const outputs = await db
-      .selectFrom('canvas_node_outputs')
-      .leftJoin('assets', 'assets.batch_id', 'canvas_node_outputs.batch_id')
-      .select([
-        'canvas_node_outputs.id',
-        'canvas_node_outputs.output_urls',
-        'canvas_node_outputs.is_selected',
-        'canvas_node_outputs.created_at',
-        'assets.type as asset_type',
-      ])
-      .where('canvas_node_outputs.canvas_id', '=', id)
-      .where('canvas_node_outputs.node_id', '=', nodeId)
-      .orderBy('canvas_node_outputs.created_at', 'desc')
-      .execute()
+    const outputs = await prisma.canvasNodeOutput.findMany({
+      where: { canvas_id: id, node_id: nodeId },
+      select: {
+        id: true,
+        output_urls: true,
+        is_selected: true,
+        created_at: true,
+        batch_id: true,
+      },
+      orderBy: { created_at: 'desc' },
+    })
 
     // Sign each output_urls array
     const signed = await Promise.all(
       outputs.map(async (row) => ({
-        ...row,
-        output_urls: await signAssetUrls(row.output_urls ?? []),
+        id: row.id,
+        output_urls: await signAssetUrls((row.output_urls as string[]) ?? []),
+        is_selected: row.is_selected,
+        created_at: row.created_at,
+        asset_type: null,
       }))
     )
 
@@ -644,48 +603,40 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
       },
     },
   }, async (request, reply) => {
-    const db = getDb()
     const { id } = request.params
 
-    const canvas = await db
-      .selectFrom('canvases')
-      .select('workspace_id')
-      .where('id', '=', id)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const canvas = await prisma.canvas.findFirst({
+      where: { id, is_deleted: false },
+      select: { workspace_id: true },
+    })
     if (!canvas) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '画布不存在' } })
 
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', canvas.workspace_id)
-      .where('user_id', '=', request.user.id)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: canvas.workspace_id, user_id: request.user.id },
+      select: { role: true },
+    })
     if (!member) return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权访问该画布' } })
 
     try {
-      await assertCanvasEnabledForWorkspace(db, canvas.workspace_id)
+      await assertCanvasEnabledForWorkspace(canvas.workspace_id)
     } catch {
       return reply.status(403).send({ success: false, error: { code: 'CANVAS_DISABLED', message: '当前团队未开通画布能力' } })
     }
 
-    const outputs = await db
-      .selectFrom('canvas_node_outputs')
-      .leftJoin('assets', 'assets.batch_id', 'canvas_node_outputs.batch_id')
-      .select([
-        'canvas_node_outputs.id',
-        'canvas_node_outputs.node_id',
-        'canvas_node_outputs.output_urls',
-        'canvas_node_outputs.is_selected',
-        'canvas_node_outputs.created_at',
-        'assets.type as asset_type',
-      ])
-      .where('canvas_node_outputs.canvas_id', '=', id)
-      .orderBy('canvas_node_outputs.created_at', 'desc')
-      .execute()
+    const outputs = await prisma.canvasNodeOutput.findMany({
+      where: { canvas_id: id },
+      select: {
+        id: true,
+        node_id: true,
+        output_urls: true,
+        is_selected: true,
+        created_at: true,
+      },
+      orderBy: { created_at: 'desc' },
+    })
 
     // Group by node_id and sign URLs
-    const grouped: Record<string, any[]> = {}
+    const grouped: Record<string, unknown[]> = {}
     for (const row of outputs) {
       const nodeId = row.node_id as string
       if (!grouped[nodeId]) grouped[nodeId] = []
@@ -694,9 +645,13 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
 
     for (const nodeId of Object.keys(grouped)) {
       grouped[nodeId] = await Promise.all(
-        grouped[nodeId].map(async (row) => ({
-          ...row,
-          output_urls: await signAssetUrls(row.output_urls ?? []),
+        (grouped[nodeId] as typeof outputs).map(async (row) => ({
+          id: row.id,
+          node_id: row.node_id,
+          output_urls: await signAssetUrls((row.output_urls as string[]) ?? []),
+          is_selected: row.is_selected,
+          created_at: row.created_at,
+          asset_type: null,
         }))
       )
     }
@@ -716,7 +671,6 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
       },
     },
   }, async (request, reply) => {
-    const db = getDb()
     const { id, nodeId } = request.params
     const { output_id } = request.body ?? {}
 
@@ -724,56 +678,43 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
       return reply.badRequest('output_id is required')
     }
 
-    const canvas = await db
-      .selectFrom('canvases')
-      .select('workspace_id')
-      .where('id', '=', id)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const canvas = await prisma.canvas.findFirst({
+      where: { id, is_deleted: false },
+      select: { workspace_id: true },
+    })
     if (!canvas) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '画布不存在' } })
 
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', canvas.workspace_id)
-      .where('user_id', '=', request.user.id)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: canvas.workspace_id, user_id: request.user.id },
+      select: { role: true },
+    })
     if (!member) return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权修改该画布' } })
 
     try {
-      await assertCanvasEnabledForWorkspace(db, canvas.workspace_id)
+      await assertCanvasEnabledForWorkspace(canvas.workspace_id)
     } catch {
       return reply.status(403).send({ success: false, error: { code: 'CANVAS_DISABLED', message: '当前团队未开通画布能力' } })
     }
 
-    const target = await db
-      .selectFrom('canvas_node_outputs')
-      .select('id')
-      .where('id', '=', output_id)
-      .where('canvas_id', '=', id)
-      .where('node_id', '=', nodeId)
-      .executeTakeFirst()
+    const target = await prisma.canvasNodeOutput.findFirst({
+      where: { id: output_id, canvas_id: id, node_id: nodeId },
+      select: { id: true },
+    })
 
     if (!target) {
       return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '目标输出不存在' } })
     }
 
-    await db.transaction().execute(async (trx) => {
-      await trx
-        .updateTable('canvas_node_outputs')
-        .set({ is_selected: false })
-        .where('canvas_id', '=', id)
-        .where('node_id', '=', nodeId)
-        .execute()
-
-      await trx
-        .updateTable('canvas_node_outputs')
-        .set({ is_selected: true })
-        .where('id', '=', output_id)
-        .where('canvas_id', '=', id)
-        .where('node_id', '=', nodeId)
-        .execute()
-    })
+    await prisma.$transaction([
+      prisma.canvasNodeOutput.updateMany({
+        where: { canvas_id: id, node_id: nodeId },
+        data: { is_selected: false },
+      }),
+      prisma.canvasNodeOutput.update({
+        where: { id: output_id },
+        data: { is_selected: true },
+      }),
+    ])
 
     return reply.send({ success: true, selected_output_id: output_id })
   })
@@ -790,23 +731,24 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
       },
     },
   }, async (request, reply) => {
-    const db = getDb()
     const { id } = request.params
     const limitN = Math.min(parseInt(request.query.limit ?? '30', 10) || 30, 100)
     const cursor = request.query.cursor
 
-    const canvas = await db
-      .selectFrom('canvases').select('workspace_id').where('id', '=', id).where('is_deleted', '=', false).executeTakeFirst()
+    const canvas = await prisma.canvas.findFirst({
+      where: { id, is_deleted: false },
+      select: { workspace_id: true },
+    })
     if (!canvas) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '画布不存在' } })
 
-    const member = await db
-      .selectFrom('workspace_members').select('role')
-      .where('workspace_id', '=', canvas.workspace_id)
-      .where('user_id', '=', request.user.id).executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: canvas.workspace_id, user_id: request.user.id },
+      select: { role: true },
+    })
     if (!member) return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权访问该画布' } })
 
     try {
-      await assertCanvasEnabledForWorkspace(db, canvas.workspace_id)
+      await assertCanvasEnabledForWorkspace(canvas.workspace_id)
     } catch {
       return reply.status(403).send({ success: false, error: { code: 'CANVAS_DISABLED', message: '当前团队未开通画布能力' } })
     }
@@ -817,45 +759,52 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
       catch { return reply.badRequest('Invalid cursor') }
     }
 
-    let query = db
-      .selectFrom('task_batches')
-      .select(['id', 'canvas_node_id', 'model', 'prompt', 'quantity', 'completed_count',
-               'failed_count', 'status', 'actual_credits', 'created_at', 'module', 'provider'])
-      .where('canvas_id', '=', id)
-      .where('is_deleted', '=', false)
-      .orderBy('created_at', 'desc')
-      .orderBy('id', 'desc')
-      .limit(limitN + 1) as any
-
-    if (decodedCursor) {
-      query = query.where((eb: any) =>
-        eb.or([
-          eb('created_at', '<', decodedCursor!.created_at),
-          eb.and([eb('created_at', '=', decodedCursor!.created_at), eb('id', '<', decodedCursor!.id)]),
-        ])
-      )
+    const whereClause: any = {
+      canvas_id: id,
+      is_deleted: false,
     }
 
-    const rows = await query.execute()
+    if (decodedCursor) {
+      whereClause.OR = [
+        { created_at: { lt: decodedCursor.created_at } },
+        {
+          created_at: decodedCursor.created_at,
+          id: { lt: decodedCursor.id },
+        },
+      ]
+    }
+
+    const rows = await prisma.taskBatch.findMany({
+      where: whereClause,
+      select: {
+        id: true, canvas_node_id: true, model: true, prompt: true, quantity: true,
+        completed_count: true, failed_count: true, status: true, actual_credits: true,
+        created_at: true, module: true, provider: true,
+      },
+      orderBy: [
+        { created_at: 'desc' },
+        { id: 'desc' },
+      ],
+      take: limitN + 1,
+    })
+
     const hasMore = rows.length > limitN
-    const items = await Promise.all((hasMore ? rows.slice(0, limitN) : rows).map(async (batch: any) => {
+    const items = await Promise.all((hasMore ? rows.slice(0, limitN) : rows).map(async (batch) => {
       const queuePosition = batch.status === 'pending'
-        ? Number((await db
-            .selectFrom('task_batches')
-            .select((eb: any) => eb.fn.countAll().as('count'))
-            .where('is_deleted', '=', false)
-            .where('status', '=', 'pending')
-            .where('provider', '=', batch.provider)
-            .where('created_at', '<', batch.created_at)
-            .executeTakeFirst() as any)?.count ?? 0)
+        ? await prisma.taskBatch.count({
+            where: {
+              is_deleted: false,
+              status: 'pending',
+              provider: batch.provider,
+              created_at: { lt: batch.created_at },
+            },
+          })
         : null
-      const processing = await db
-        .selectFrom('tasks')
-        .select('processing_started_at')
-        .where('batch_id', '=', batch.id)
-        .where('processing_started_at', 'is not', null)
-        .orderBy('processing_started_at', 'asc')
-        .executeTakeFirst()
+      const processing = await prisma.task.findFirst({
+        where: { batch_id: batch.id, processing_started_at: { not: null } },
+        select: { processing_started_at: true },
+        orderBy: { processing_started_at: 'asc' },
+      })
       const { provider: _provider, ...item } = batch
       return {
         ...item,
@@ -863,6 +812,7 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
         processing_started_at: processing?.processing_started_at ?? null,
       }
     }))
+
     const nextCursor = hasMore
       ? Buffer.from(JSON.stringify({ created_at: items[items.length - 1].created_at, id: items[items.length - 1].id })).toString('base64')
       : null
@@ -882,24 +832,25 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
       },
     },
   }, async (request, reply) => {
-    const db = getDb()
     const { id } = request.params
     const limitN = Math.min(parseInt(request.query.limit ?? '50', 10) || 50, 200)
     const cursor = request.query.cursor
     const type = request.query.type
 
-    const canvas = await db
-      .selectFrom('canvases').select('workspace_id').where('id', '=', id).where('is_deleted', '=', false).executeTakeFirst()
+    const canvas = await prisma.canvas.findFirst({
+      where: { id, is_deleted: false },
+      select: { workspace_id: true },
+    })
     if (!canvas) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '画布不存在' } })
 
-    const member = await db
-      .selectFrom('workspace_members').select('role')
-      .where('workspace_id', '=', canvas.workspace_id)
-      .where('user_id', '=', request.user.id).executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: canvas.workspace_id, user_id: request.user.id },
+      select: { role: true },
+    })
     if (!member) return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '无权访问该画布' } })
 
     try {
-      await assertCanvasEnabledForWorkspace(db, canvas.workspace_id)
+      await assertCanvasEnabledForWorkspace(canvas.workspace_id)
     } catch {
       return reply.status(403).send({ success: false, error: { code: 'CANVAS_DISABLED', message: '当前团队未开通画布能力' } })
     }
@@ -910,42 +861,56 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
       catch { return reply.badRequest('Invalid cursor') }
     }
 
-    let query = db
-      .selectFrom('assets as a')
-      .innerJoin('task_batches as b', 'b.id', 'a.batch_id')
-      .select(['a.id', 'a.type', 'a.storage_url', 'a.original_url', 'a.created_at',
-               'b.id as batch_id', 'b.canvas_node_id', 'b.prompt', 'b.model'])
-      .where('b.canvas_id', '=', id)
-      .where('a.is_deleted', '=', false)
-      .where((eb: any) => eb.or([
-        eb('a.transfer_status', '=', 'completed'),
-        eb('a.original_url', 'is not', null),
-      ]))
-      .orderBy('a.created_at', 'desc')
-      .orderBy('a.id', 'desc')
-      .limit(limitN + 1) as any
-
-    if (type) query = query.where('a.type', '=', type)
-
-    if (decodedCursor) {
-      query = query.where((eb: any) =>
-        eb.or([
-          eb('a.created_at', '<', decodedCursor!.created_at),
-          eb.and([eb('a.created_at', '=', decodedCursor!.created_at), eb('a.id', '<', decodedCursor!.id)]),
-        ])
-      )
+    const whereClause: any = {
+      batch: { canvas_id: id },
+      is_deleted: false,
+      OR: [
+        { transfer_status: 'completed' },
+        { original_url: { not: null } },
+      ],
     }
 
-    const rows = await query.execute()
+    if (type) whereClause.type = type
+
+    if (decodedCursor) {
+      whereClause.OR = [
+        ...whereClause.OR,
+        { created_at: { lt: decodedCursor.created_at } },
+        {
+          created_at: decodedCursor.created_at,
+          id: { lt: decodedCursor.id },
+        },
+      ]
+    }
+
+    const rows = await prisma.asset.findMany({
+      where: whereClause,
+      select: {
+        id: true, type: true, storage_url: true, original_url: true, created_at: true,
+        batch: { select: { id: true, canvas_node_id: true, prompt: true, model: true } },
+      },
+      orderBy: [
+        { created_at: 'desc' },
+        { id: 'desc' },
+      ],
+      take: limitN + 1,
+    })
+
     const hasMore = rows.length > limitN
     const items = hasMore ? rows.slice(0, limitN) : rows
 
     // Sign storage URLs
     const signedItems = await Promise.all(
-      items.map(async (item: any) => ({
-        ...item,
+      items.map(async (item) => ({
+        id: item.id,
+        type: item.type,
         storage_url: await signAssetUrl(item.storage_url),
         original_url: item.original_url ? await signAssetUrl(item.original_url) : null,
+        created_at: item.created_at,
+        batch_id: item.batch.id,
+        canvas_node_id: item.batch.canvas_node_id,
+        prompt: item.batch.prompt,
+        model: item.batch.model,
       }))
     )
 
@@ -965,18 +930,18 @@ export async function canvasRoutes(app: FastifyInstance): Promise<void> {
       },
     },
   }, async (request, reply) => {
-    const db = getDb()
     const userId = request.user.id
 
-    const memberships = await db
-      .selectFrom('workspace_members')
-      .innerJoin('workspaces', 'workspaces.id', 'workspace_members.workspace_id')
-      .innerJoin('teams', 'teams.id', 'workspaces.team_id')
-      .select('workspace_members.workspace_id')
-      .where('workspace_members.user_id', '=', userId)
-      .where('teams.team_type', '=', 'avatar_enabled')
-      .limit(1)
-      .execute()
+    const memberships = await prisma.workspaceMember.findMany({
+      where: {
+        user_id: userId,
+        workspace: {
+          team: { team_type: 'avatar_enabled' },
+        },
+      },
+      select: { workspace_id: true },
+      take: 1,
+    })
 
     if (memberships.length === 0) {
       return reply.status(403).send({ success: false, error: { code: 'CANVAS_DISABLED', message: '当前团队未开通画布能力' } })

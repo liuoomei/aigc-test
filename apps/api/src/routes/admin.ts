@@ -1,6 +1,5 @@
 import type { FastifyInstance } from 'fastify'
-import { getDb } from '@aigc/db'
-import { sql } from 'kysely'
+import { prisma } from '../lib/prisma.js'
 import bcrypt from 'bcryptjs'
 import { adminGuard } from '../plugins/guards.js'
 import { signAssetUrl } from '../lib/storage.js'
@@ -13,78 +12,83 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
 
   // GET /admin/teams — list all teams with member count and credit balance
   app.get('/admin/teams', async () => {
-    const db = getDb()
-    const teams = await db
-      .selectFrom('teams')
-      .leftJoin('credit_accounts', (join) =>
-        join
-          .onRef('credit_accounts.team_id', '=', 'teams.id')
-          .on('credit_accounts.owner_type', '=', 'team')
-      )
-      .select([
-        'teams.id', 'teams.name', 'teams.owner_id', 'teams.plan_tier', 'teams.team_type', 'teams.created_at', 'teams.allow_member_topup',
-        'credit_accounts.balance', 'credit_accounts.frozen_credits',
-        'credit_accounts.total_earned', 'credit_accounts.total_spent',
-      ])
-      .where('teams.is_deleted', '=', false)
-      .orderBy('teams.created_at', 'asc')
-      .execute()
+    const teams = await prisma.team.findMany({
+      where: { is_deleted: false },
+      include: {
+        creditAccount: true,
+      },
+      orderBy: { created_at: 'asc' },
+    })
 
     // Get member counts
-    const memberCounts = await db
-      .selectFrom('team_members')
-      .select(['team_id', db.fn.count('user_id').as('member_count')])
-      .groupBy('team_id')
-      .execute()
-
-    const countMap = new Map(memberCounts.map(m => [m.team_id, Number(m.member_count)]))
+    const memberCounts = await prisma.teamMember.groupBy({
+      by: ['team_id'],
+      _count: { user_id: true },
+    })
+    const countMap = new Map(memberCounts.map((m: typeof memberCounts[number]) => [m.team_id, m._count.user_id]))
 
     // Get workspace counts
-    const wsCounts = await db
-      .selectFrom('workspaces')
-      .select(['team_id', db.fn.count('id').as('workspace_count')])
-      .where('is_deleted', '=', false)
-      .groupBy('team_id')
-      .execute()
-
-    const wsCountMap = new Map(wsCounts.map(w => [w.team_id, Number(w.workspace_count)]))
+    const wsCounts = await prisma.workspace.groupBy({
+      by: ['team_id'],
+      where: { is_deleted: false },
+      _count: { id: true },
+    })
+    const wsCountMap = new Map(wsCounts.map((w: typeof wsCounts[number]) => [w.team_id, w._count.id]))
 
     // Get owner usernames
-    const ownerIds = [...new Set(teams.map(t => t.owner_id).filter(Boolean))]
+    const ownerIds = [...new Set<string>(teams.map((t: typeof teams[number]) => t.owner_id).filter(Boolean) as string[])]
     const ownerMap = new Map<string, string>()
     if (ownerIds.length > 0) {
-      const owners = await db
-        .selectFrom('users')
-        .select(['id', 'username'])
-        .where('id', 'in', ownerIds)
-        .execute()
+      const owners = await prisma.user.findMany({
+        where: { id: { in: ownerIds } },
+        select: { id: true, username: true },
+      })
       for (const o of owners) ownerMap.set(o.id, o.username)
     }
 
     // Get lifetime generation usage per team from ledger (confirm entries only)
-    const teamIds = teams.map(t => t.id)
+    const teamIds = teams.map((t: typeof teams[number]) => t.id)
     const lifetimeMap = new Map<string, number>()
     if (teamIds.length > 0) {
-      const rows = await db
-        .selectFrom('credits_ledger')
-        .innerJoin('credit_accounts', 'credit_accounts.id', 'credits_ledger.credit_account_id')
-        .select(['credit_accounts.team_id', db.fn.sum('credits_ledger.amount').as('total')])
-        .where('credits_ledger.type', '=', 'confirm')
-        .where('credit_accounts.team_id', 'in', teamIds)
-        .groupBy('credit_accounts.team_id')
-        .execute()
+      const rows = await prisma.creditsLedger.groupBy({
+        by: ['credit_account_id'],
+        where: {
+          type: 'confirm',
+          creditAccount: {
+            team_id: { in: teamIds },
+          },
+        },
+        _sum: { amount: true },
+      })
+      // Need to get team_id from credit_accounts
+      const creditAccountRows = await prisma.creditAccount.findMany({
+        where: { team_id: { in: teamIds } },
+        select: { id: true, team_id: true },
+      })
+      const creditToTeam = new Map<string, string>(
+        creditAccountRows
+          .filter((c): c is typeof c & { team_id: string } => c.team_id !== null)
+          .map((c) => [c.id, c.team_id])
+      )
       for (const r of rows) {
-        if (r.team_id) lifetimeMap.set(r.team_id, Math.abs(Number(r.total ?? 0)))
+        const teamId = creditToTeam.get(r.credit_account_id)
+        if (teamId) lifetimeMap.set(teamId, Math.abs(Number(r._sum?.amount) ?? 0))
       }
     }
 
     return {
-      data: teams.map(t => ({
-        ...t,
-        balance: t.balance ?? 0,
-        frozen_credits: t.frozen_credits ?? 0,
-        total_earned: t.total_earned ?? 0,
-        total_spent: t.total_spent ?? 0,
+      data: teams.map((t: typeof teams[number]) => ({
+        id: t.id,
+        name: t.name,
+        owner_id: t.owner_id,
+        plan_tier: t.plan_tier,
+        team_type: t.team_type,
+        created_at: t.created_at,
+        allow_member_topup: t.allow_member_topup,
+        balance: t.creditAccount?.balance ?? 0,
+        frozen_credits: t.creditAccount?.frozen_credits ?? 0,
+        total_earned: t.creditAccount?.total_earned ?? 0,
+        total_spent: t.creditAccount?.total_spent ?? 0,
         lifetime_used: lifetimeMap.get(t.id) ?? 0,
         member_count: countMap.get(t.id) ?? 0,
         workspace_count: wsCountMap.get(t.id) ?? 0,
@@ -97,29 +101,41 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: { id: string } }>('/admin/teams/:id/members', {
     config: { rateLimit: false },
   }, async (request, reply) => {
-    const db = getDb()
     const teamId = request.params.id
 
-    const team = await db
-      .selectFrom('teams')
-      .select('id')
-      .where('id', '=', teamId)
-      .executeTakeFirst()
+    const team = await prisma.team.findUnique({
+      where: { id: teamId },
+      select: { id: true },
+    })
     if (!team) return reply.notFound('Team not found')
 
-    const members = await db
-      .selectFrom('team_members')
-      .innerJoin('users', 'users.id', 'team_members.user_id')
-      .select([
-        'users.id', 'users.username', 'users.account', 'users.avatar_url',
-        'team_members.role', 'team_members.credit_quota', 'team_members.credit_used',
-        'team_members.joined_at',
-      ])
-      .where('team_members.team_id', '=', teamId)
-      .orderBy('team_members.joined_at', 'asc')
-      .execute()
+    const members = await prisma.teamMember.findMany({
+      where: { team_id: teamId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            username: true,
+            account: true,
+            avatar_url: true,
+          },
+        },
+      },
+      orderBy: { joined_at: 'asc' },
+    })
 
-    return { data: members }
+    return {
+      data: members.map((m: typeof members[number]) => ({
+        id: m.user.id,
+        username: m.user.username,
+        account: m.user.account,
+        avatar_url: m.user.avatar_url,
+        role: m.role,
+        credit_quota: m.credit_quota,
+        credit_used: m.credit_used,
+        joined_at: m.joined_at,
+      })),
+    }
   })
 
   // PATCH /admin/teams/:id/members/:uid — admin update member quota/period
@@ -143,7 +159,6 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     if (credit_quota === undefined && quota_period === undefined) {
       return reply.badRequest('At least one of credit_quota or quota_period is required')
     }
-    const db = getDb()
     const updates: Record<string, unknown> = {}
     if (credit_quota !== undefined) updates.credit_quota = credit_quota
     if (quota_period !== undefined) {
@@ -157,12 +172,15 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         updates.quota_reset_at = null
       }
     }
-    await db
-      .updateTable('team_members')
-      .set(updates)
-      .where('team_id', '=', request.params.id)
-      .where('user_id', '=', request.params.uid)
-      .execute()
+    await prisma.teamMember.update({
+      where: {
+        team_id_user_id: {
+          team_id: request.params.id,
+          user_id: request.params.uid,
+        },
+      },
+      data: updates,
+    })
     return { success: true }
   })
 
@@ -170,13 +188,15 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { id: string; uid: string } }>('/admin/teams/:id/members/:uid/reset-credits', {
     config: { rateLimit: false },
   }, async (request, reply) => {
-    const db = getDb()
-    const member = await db
-      .selectFrom('team_members')
-      .select(['credit_used', 'quota_period'])
-      .where('team_id', '=', request.params.id)
-      .where('user_id', '=', request.params.uid)
-      .executeTakeFirst()
+    const member = await prisma.teamMember.findUnique({
+      where: {
+        team_id_user_id: {
+          team_id: request.params.id,
+          user_id: request.params.uid,
+        },
+      },
+      select: { credit_used: true, quota_period: true },
+    })
     if (!member) return reply.notFound('成员不存在')
     const updates: Record<string, unknown> = { credit_used: 0 }
     if (member.quota_period) {
@@ -185,51 +205,49 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         ? new Date(now.getFullYear(), now.getMonth(), now.getDate() + 7)
         : new Date(now.getFullYear(), now.getMonth() + 1, now.getDate())
     }
-    await db
-      .updateTable('team_members')
-      .set(updates)
-      .where('team_id', '=', request.params.id)
-      .where('user_id', '=', request.params.uid)
-      .execute()
+    await prisma.teamMember.update({
+      where: {
+        team_id_user_id: {
+          team_id: request.params.id,
+          user_id: request.params.uid,
+        },
+      },
+      data: updates,
+    })
     return { success: true, credit_used: 0 }
   })
 
   // GET /admin/teams/:id/workspaces — list team workspaces with batch stats
   app.get<{ Params: { id: string } }>('/admin/teams/:id/workspaces', async (request, reply) => {
-    const db = getDb()
     const teamId = request.params.id
 
-    const team = await db
-      .selectFrom('teams')
-      .select('id')
-      .where('id', '=', teamId)
-      .executeTakeFirst()
+    const team = await prisma.team.findUnique({
+      where: { id: teamId },
+      select: { id: true },
+    })
     if (!team) return reply.notFound('Team not found')
 
-    const workspaces = await db
-      .selectFrom('workspaces')
-      .select(['id', 'name', 'created_at'])
-      .where('team_id', '=', teamId)
-      .where('is_deleted', '=', false)
-      .orderBy('created_at', 'asc')
-      .execute()
+    const workspaces = await prisma.workspace.findMany({
+      where: { team_id: teamId, is_deleted: false },
+      select: { id: true, name: true, created_at: true },
+      orderBy: { created_at: 'asc' },
+    })
 
     // Get member counts per workspace
-    const wsIds = workspaces.map(w => w.id)
+    const wsIds = workspaces.map((w: typeof workspaces[number]) => w.id)
     const wsMemberMap = new Map<string, number>()
     const wsBatchMap = new Map<string, { total: number; completed: number; failed: number }>()
 
     if (wsIds.length > 0) {
-      const wsMemberCounts = await db
-        .selectFrom('workspace_members')
-        .select(['workspace_id', db.fn.count('user_id').as('count')])
-        .where('workspace_id', 'in', wsIds)
-        .groupBy('workspace_id')
-        .execute()
-      for (const m of wsMemberCounts) wsMemberMap.set(m.workspace_id, Number(m.count))
+      const wsMemberCounts = await prisma.workspaceMember.groupBy({
+        by: ['workspace_id'],
+        where: { workspace_id: { in: wsIds } },
+        _count: { user_id: true },
+      })
+      for (const m of wsMemberCounts) wsMemberMap.set(m.workspace_id, m._count.user_id)
 
-      // Get batch stats per workspace
-      const batchStats = await sql<{ workspace_id: string; total: string; completed: string; failed: string }>`
+      // Get batch stats per workspace using raw query
+      const batchStats = await prisma.$queryRaw<{ workspace_id: string; total: string; completed: string; failed: string }[]>`
         SELECT
           workspace_id,
           COUNT(*) as total,
@@ -238,8 +256,8 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         FROM task_batches
         WHERE workspace_id = ANY(${wsIds}::uuid[]) AND is_deleted = false
         GROUP BY workspace_id
-      `.execute(db)
-      for (const s of batchStats.rows) {
+      `
+      for (const s of batchStats) {
         wsBatchMap.set(s.workspace_id, {
           total: Number(s.total),
           completed: Number(s.completed),
@@ -249,7 +267,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     }
 
     return {
-      data: workspaces.map(w => ({
+      data: workspaces.map((w: typeof workspaces[number]) => ({
         ...w,
         member_count: wsMemberMap.get(w.id) ?? 0,
         batch_total: wsBatchMap.get(w.id)?.total ?? 0,
@@ -261,36 +279,41 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
 
   // GET /admin/workspaces/:id/batches — list workspace batches with user info
   app.get<{ Params: { id: string }; Querystring: { cursor?: string; limit?: string } }>('/admin/workspaces/:id/batches', async (request) => {
-    const db = getDb()
     const wsId = request.params.id
     const limit = Math.min(parseInt(request.query.limit ?? '20', 10), 100)
 
-    let query = db
-      .selectFrom('task_batches')
-      .selectAll()
-      .where('workspace_id', '=', wsId)
-      .where('is_deleted', '=', false)
-      .orderBy('created_at', 'desc')
-      .limit(limit + 1)
+    const where: Record<string, unknown> = {
+      workspace_id: wsId,
+      is_deleted: false,
+    }
 
     if (request.query.cursor) {
       try {
         const decoded = JSON.parse(Buffer.from(request.query.cursor, 'base64').toString('utf-8'))
-        query = query.where((eb: any) =>
-          eb.or([
-            eb('created_at', '<', decoded.created_at),
-            eb.and([
-              eb('created_at', '=', decoded.created_at),
-              eb('id', '<', decoded.id),
-            ]),
-          ]),
-        )
+        where.AND = [
+          {
+            OR: [
+              { created_at: { lt: new Date(decoded.created_at) } },
+              {
+                AND: [
+                  { created_at: { equals: new Date(decoded.created_at) } },
+                  { id: { lt: decoded.id } },
+                ],
+              },
+            ],
+          },
+        ]
       } catch {
         // ignore invalid cursor
       }
     }
 
-    const rows = await query.execute()
+    const rows = await prisma.taskBatch.findMany({
+      where,
+      orderBy: { created_at: 'desc' },
+      take: limit + 1,
+    })
+
     const hasMore = rows.length > limit
     const batches = hasMore ? rows.slice(0, limit) : rows
 
@@ -298,11 +321,10 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     const userIds = [...new Set(batches.map((b: any) => b.user_id))]
     const userMap = new Map<string, { id: string; username: string }>()
     if (userIds.length > 0) {
-      const users = await db
-        .selectFrom('users')
-        .select(['id', 'username'])
-        .where('id', 'in', userIds)
-        .execute()
+      const users = await prisma.user.findMany({
+        where: { id: { in: userIds } },
+        select: { id: true, username: true },
+      })
       for (const u of users) userMap.set(u.id, { id: u.id, username: u.username })
     }
 
@@ -310,20 +332,18 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     const batchIds = batches.map((b: any) => b.id)
     const thumbnailMap = new Map<string, string[]>()
     if (batchIds.length > 0) {
-      const assets = await db
-        .selectFrom('assets')
-        .select(['batch_id', 'storage_url', 'original_url'])
-        .where('batch_id', 'in', batchIds)
-        .where('is_deleted', '=', false)
-        .execute()
+      const assets = await prisma.asset.findMany({
+        where: { batch_id: { in: batchIds }, is_deleted: false },
+        select: { batch_id: true, storage_url: true, original_url: true },
+      })
       for (const a of assets) {
-        const rawUrl = (a as any).storage_url ?? (a as any).original_url
+        const rawUrl = a.storage_url ?? a.original_url
         if (!rawUrl) continue
         const signedUrl = await signAssetUrl(rawUrl)
         if (!signedUrl) continue
-        const list = thumbnailMap.get((a as any).batch_id) ?? []
+        const list = thumbnailMap.get(a.batch_id) ?? []
         list.push(signedUrl)
-        thumbnailMap.set((a as any).batch_id, list)
+        thumbnailMap.set(a.batch_id, list)
       }
     }
 
@@ -389,15 +409,11 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       return reply.badRequest('手机号必须是 11 位数字')
     }
 
-    const db = getDb()
-
     // Check duplicate team name
-    const existingTeam = await db
-      .selectFrom('teams')
-      .select('id')
-      .where('name', '=', name)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const existingTeam = await prisma.team.findFirst({
+      where: { name, is_deleted: false },
+      select: { id: true },
+    })
     if (existingTeam) {
       return reply.status(409).send({
         success: false,
@@ -406,12 +422,10 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Check if owner user exists (by email or phone)
-    let owner = await db
-      .selectFrom('users')
-      .select(['id', 'account', 'username', 'status'])
-      .$if(!!owner_email, (qb) => qb.where('email', '=', owner_email!))
-      .$if(!owner_email && !!owner_phone, (qb) => qb.where('phone', '=', owner_phone!))
-      .executeTakeFirst()
+    let owner = await prisma.user.findFirst({
+      where: owner_email ? { email: owner_email } : { phone: owner_phone! },
+      select: { id: true, account: true, username: true, status: true },
+    })
 
     const ownerWasExisting = !!owner
 
@@ -427,9 +441,8 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         ? owner_email.split('@')[0]
         : owner_phone!.slice(-4)
 
-      const result = await db
-        .insertInto('users')
-        .values({
+      const result = await prisma.user.create({
+        data: {
           account,
           email: owner_email ?? null,
           phone: owner_phone ?? null,
@@ -438,9 +451,9 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
           role: 'member',
           status: 'active',
           plan_tier: 'free',
-        })
-        .returning(['id', 'account', 'username'])
-        .executeTakeFirstOrThrow()
+        },
+        select: { id: true, account: true, username: true },
+      })
       owner = { id: result.id, account: result.account, username: result.username, status: 'active' }
     } else {
       // User exists — reactivate if suspended, and update password if a new one is provided
@@ -450,17 +463,18 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         updates.password_hash = await bcrypt.hash(owner_password, 12)
       }
       if (Object.keys(updates).length > 0) {
-        await db.updateTable('users').set(updates).where('id', '=', owner.id).execute()
+        await prisma.user.update({
+          where: { id: owner.id },
+          data: updates,
+        })
       }
     }
 
     // Check owner uniqueness: one active team per owner
-    const existingOwnership = await db
-      .selectFrom('teams')
-      .select('id')
-      .where('owner_id', '=', owner.id)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const existingOwnership = await prisma.team.findFirst({
+      where: { owner_id: owner.id, is_deleted: false },
+      select: { id: true },
+    })
     if (existingOwnership) {
       return reply.status(409).send({
         success: false,
@@ -469,77 +483,71 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Create team
-    const team = await db
-      .insertInto('teams')
-      .values({
+    const team = await prisma.team.create({
+      data: {
         name,
         owner_id: owner.id,
         plan_tier: 'free',
         team_type: team_type ?? 'standard',
-      })
-      .returning(['id', 'name', 'created_at'])
-      .executeTakeFirstOrThrow()
+      },
+      select: { id: true, name: true, created_at: true },
+    })
 
     // Add owner to team_members
-    await db
-      .insertInto('team_members')
-      .values({
+    await prisma.teamMember.create({
+      data: {
         team_id: team.id,
         user_id: owner.id,
         role: 'owner',
-      })
-      .execute()
+      },
+    })
 
     // Create credit account for team
-    await db
-      .insertInto('credit_accounts')
-      .values({
+    await prisma.creditAccount.create({
+      data: {
         owner_type: 'team',
         team_id: team.id,
         balance: initial_credits ?? 0,
-      })
-      .execute()
+      },
+    })
 
     // Create default workspace
-    const workspace = await db
-      .insertInto('workspaces')
-      .values({
+    const workspace = await prisma.workspace.create({
+      data: {
         team_id: team.id,
         name: '默认工作区',
         created_by: owner.id,
-      })
-      .returning(['id', 'name'])
-      .executeTakeFirstOrThrow()
+      },
+      select: { id: true, name: true },
+    })
 
     // Add owner to workspace
-    await db
-      .insertInto('workspace_members')
-      .values({
+    await prisma.workspaceMember.create({
+      data: {
         workspace_id: workspace.id,
         user_id: owner.id,
         role: 'admin',
-      })
-      .execute()
+      },
+    })
 
     // If initial credits > 0, add ledger entry
     if (initial_credits && initial_credits > 0) {
-      const creditAccount = await db
-        .selectFrom('credit_accounts')
-        .select('id')
-        .where('team_id', '=', team.id)
-        .where('owner_type', '=', 'team')
-        .executeTakeFirstOrThrow()
+      const creditAccount = await prisma.creditAccount.findFirst({
+        where: { team_id: team.id, owner_type: 'team' },
+        select: { id: true },
+      })
 
-      await db
-        .insertInto('credits_ledger')
-        .values({
-          credit_account_id: creditAccount.id,
-          user_id: request.user.id,
-          amount: initial_credits,
-          type: 'topup',
-          description: 'Initial team credits',
+      if (creditAccount) {
+        await prisma.creditsLedger.create({
+          data: {
+            credit_account_id: creditAccount.id,
+            user_id: request.user.id,
+            amount: initial_credits,
+            type: 'topup',
+            description: 'Initial team credits',
+          },
         })
-        .execute()
+      }
     }
 
     return reply.status(201).send({
@@ -562,11 +570,13 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       },
     },
   }, async (request, reply) => {
-    const db = getDb()
     const { id } = request.params
     const { team_type, allow_member_topup } = request.body
 
-    const team = await db.selectFrom('teams').select('id').where('id', '=', id).executeTakeFirst()
+    const team = await prisma.team.findUnique({
+      where: { id },
+      select: { id: true },
+    })
     if (!team) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '团队不存在' } })
 
     const updates: Record<string, unknown> = {}
@@ -574,7 +584,10 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     if (allow_member_topup !== undefined) updates.allow_member_topup = allow_member_topup
 
     if (Object.keys(updates).length > 0) {
-      await db.updateTable('teams').set(updates as any).where('id', '=', id).execute()
+      await prisma.team.update({
+        where: { id },
+        data: updates,
+      })
     }
 
     return reply.send({ success: true })
@@ -582,86 +595,72 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
 
   // DELETE /admin/teams/:id — soft-delete team + cascade workspaces + task_batches
   app.delete<{ Params: { id: string } }>('/admin/teams/:id', async (request, reply) => {
-    const db = getDb()
     const { id } = request.params
 
-    const team = await db
-      .selectFrom('teams')
-      .select(['id', 'name'])
-      .where('id', '=', id)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const team = await prisma.team.findFirst({
+      where: { id, is_deleted: false },
+      select: { id: true, name: true },
+    })
     if (!team) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '团队不存在' } })
 
     const now = new Date()
 
     // Cascade: soft-delete all workspaces
-    const wsIds = await db
-      .selectFrom('workspaces')
-      .select('id')
-      .where('team_id', '=', id)
-      .where('is_deleted', '=', false)
-      .execute()
+    const wsIds = await prisma.workspace.findMany({
+      where: { team_id: id, is_deleted: false },
+      select: { id: true },
+    })
 
     if (wsIds.length > 0) {
-      const wsIdList = wsIds.map(w => w.id)
-      await db
-        .updateTable('workspaces')
-        .set({ is_deleted: true, deleted_at: now })
-        .where('id', 'in', wsIdList)
-        .execute()
+      const wsIdList = wsIds.map((w: typeof wsIds[number]) => w.id)
+      await prisma.workspace.updateMany({
+        where: { id: { in: wsIdList } },
+        data: { is_deleted: true, deleted_at: now },
+      })
 
       // Cascade: soft-delete task_batches in those workspaces
-      await db
-        .updateTable('task_batches')
-        .set({ is_deleted: true, deleted_at: now })
-        .where('workspace_id', 'in', wsIdList)
-        .where('is_deleted', '=', false)
-        .execute()
+      await prisma.taskBatch.updateMany({
+        where: { workspace_id: { in: wsIdList }, is_deleted: false },
+        data: { is_deleted: true, deleted_at: now },
+      })
     }
 
     // Soft-delete the team
-    await db
-      .updateTable('teams')
-      .set({ is_deleted: true, deleted_at: now })
-      .where('id', '=', id)
-      .execute()
+    await prisma.team.update({
+      where: { id },
+      data: { is_deleted: true, deleted_at: now },
+    })
 
     // Suspend members who no longer belong to any active team
-    const memberIds = (await db
-      .selectFrom('team_members')
-      .select('user_id')
-      .where('team_id', '=', id)
-      .execute()
-    ).map(m => m.user_id)
+    const memberIds = (await prisma.teamMember.findMany({
+      where: { team_id: id },
+      select: { user_id: true },
+    })).map((m: { user_id: string }) => m.user_id)
 
     if (memberIds.length > 0) {
       // Count active teams per member (excluding the just-deleted team)
-      const activeCounts = await db
-        .selectFrom('team_members')
-        .innerJoin('teams', 'teams.id', 'team_members.team_id')
-        .select(['team_members.user_id', db.fn.count('team_members.team_id').as('count')])
-        .where('team_members.user_id', 'in', memberIds)
-        .where('teams.is_deleted', '=', false)
-        .groupBy('team_members.user_id')
-        .execute()
+      const activeCounts = await prisma.teamMember.groupBy({
+        by: ['user_id'],
+        where: {
+          user_id: { in: memberIds },
+          team: { is_deleted: false },
+        },
+        _count: { team_id: true },
+      })
 
-      const countMap = new Map(activeCounts.map(r => [r.user_id, Number(r.count)]))
-      const toSuspend = memberIds.filter(uid => (countMap.get(uid) ?? 0) === 0)
+      const countMap = new Map(activeCounts.map((r: typeof activeCounts[number]) => [r.user_id, r._count.team_id]))
+      const toSuspend = memberIds.filter((uid: string) => (countMap.get(uid) ?? 0) === 0)
 
       if (toSuspend.length > 0) {
-        await db
-          .updateTable('users')
-          .set({ status: 'suspended' })
-          .where('id', 'in', toSuspend)
-          .execute()
+        await prisma.user.updateMany({
+          where: { id: { in: toSuspend } },
+          data: { status: 'suspended' },
+        })
 
-        await db
-          .updateTable('refresh_tokens')
-          .set({ revoked_at: sql`NOW()` })
-          .where('user_id', 'in', toSuspend)
-          .where('revoked_at', 'is', null)
-          .execute()
+        await prisma.refreshToken.updateMany({
+          where: { user_id: { in: toSuspend }, revoked_at: null },
+          data: { revoked_at: new Date() },
+        })
       }
     }
 
@@ -670,91 +669,89 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
 
   // GET /admin/trash — list soft-deleted teams and workspaces (within 7 days)
   app.get('/admin/trash', async () => {
-    const db = getDb()
     const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
 
-    const teams = await db
-      .selectFrom('teams')
-      .select(['id', 'name', 'owner_id', 'deleted_at'])
-      .where('is_deleted', '=', true)
-      .where('deleted_at', '>=', cutoff as any)
-      .orderBy('deleted_at', 'desc')
-      .execute()
+    const teams = await prisma.team.findMany({
+      where: {
+        is_deleted: true,
+        deleted_at: { gte: cutoff },
+      },
+      select: { id: true, name: true, owner_id: true, deleted_at: true },
+      orderBy: { deleted_at: 'desc' },
+    })
 
-    const workspaces = await db
-      .selectFrom('workspaces')
-      .select(['id', 'name', 'team_id', 'deleted_at'])
-      .where('is_deleted', '=', true)
-      .where('deleted_at', '>=', cutoff as any)
-      // Only show workspaces whose parent team is NOT deleted (team-level deletes are under teams tab)
-      .where((eb) =>
-        eb.not(eb.exists(
-          eb.selectFrom('teams')
-            .select('id')
-            .whereRef('teams.id', '=', 'workspaces.team_id')
-            .where('teams.is_deleted', '=', true)
-        ))
-      )
-      .orderBy('deleted_at', 'desc')
-      .execute()
+    const workspaces = await prisma.workspace.findMany({
+      where: {
+        is_deleted: true,
+        deleted_at: { gte: cutoff },
+      },
+      select: { id: true, name: true, team_id: true, deleted_at: true },
+      orderBy: { deleted_at: 'desc' },
+    })
+
+    // Filter workspaces whose parent team is NOT deleted
+    const filteredWorkspaces: typeof workspaces = []
+    for (const w of workspaces) {
+      if (!w.team_id) continue
+      const parentTeam = await prisma.team.findUnique({
+        where: { id: w.team_id },
+        select: { is_deleted: true },
+      })
+      if (parentTeam && !parentTeam.is_deleted) {
+        filteredWorkspaces.push(w)
+      }
+    }
 
     // Owner usernames for teams
-    const ownerIds = [...new Set(teams.map(t => t.owner_id))]
+    const ownerIds = [...new Set<string>(teams.map((t: typeof teams[number]) => t.owner_id))]
     const ownerMap = new Map<string, string>()
     if (ownerIds.length > 0) {
-      const owners = await db
-        .selectFrom('users')
-        .select(['id', 'username'])
-        .where('id', 'in', ownerIds)
-        .execute()
+      const owners = await prisma.user.findMany({
+        where: { id: { in: ownerIds } },
+        select: { id: true, username: true },
+      })
       for (const o of owners) ownerMap.set(o.id, o.username)
     }
 
     // Team names for workspaces
-    const teamIds = [...new Set(workspaces.map(w => w.team_id))]
+    const teamIds = [...new Set<string>(filteredWorkspaces.map((w) => w.team_id).filter((id): id is string => id !== null))]
     const teamNameMap = new Map<string, string>()
     if (teamIds.length > 0) {
-      const teamRows = await db
-        .selectFrom('teams')
-        .select(['id', 'name'])
-        .where('id', 'in', teamIds)
-        .execute()
+      const teamRows = await prisma.team.findMany({
+        where: { id: { in: teamIds } },
+        select: { id: true, name: true },
+      })
       for (const t of teamRows) teamNameMap.set(t.id, t.name)
     }
 
     return {
-      teams: teams.map(t => ({
+      teams: teams.map((t: typeof teams[number]) => ({
         ...t,
         owner_username: ownerMap.get(t.owner_id) ?? null,
         deleted_at: t.deleted_at,
       })),
-      workspaces: workspaces.map(w => ({
+      workspaces: filteredWorkspaces.map((w: typeof filteredWorkspaces[number]) => ({
         ...w,
-        team_name: teamNameMap.get(w.team_id) ?? null,
+        team_name: w.team_id ? (teamNameMap.get(w.team_id) ?? null) : null,
       })),
     }
   })
 
   // POST /admin/trash/teams/:id/restore — restore soft-deleted team
   app.post<{ Params: { id: string } }>('/admin/trash/teams/:id/restore', async (request, reply) => {
-    const db = getDb()
     const { id } = request.params
 
-    const team = await db
-      .selectFrom('teams')
-      .select(['id', 'name', 'owner_id'])
-      .where('id', '=', id)
-      .where('is_deleted', '=', true)
-      .executeTakeFirst()
+    const team = await prisma.team.findFirst({
+      where: { id, is_deleted: true },
+      select: { id: true, name: true, owner_id: true },
+    })
     if (!team) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '已删除的团队不存在或已过期' } })
 
     // Check owner uniqueness before restoring
-    const ownerConflict = await db
-      .selectFrom('teams')
-      .select('id')
-      .where('owner_id', '=', team.owner_id)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const ownerConflict = await prisma.team.findFirst({
+      where: { owner_id: team.owner_id, is_deleted: false },
+      select: { id: true },
+    })
     if (ownerConflict) {
       return reply.status(409).send({
         success: false,
@@ -763,12 +760,10 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Check team name uniqueness before restoring
-    const nameConflict = await db
-      .selectFrom('teams')
-      .select('id')
-      .where('name', '=', team.name)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const nameConflict = await prisma.team.findFirst({
+      where: { name: team.name, is_deleted: false },
+      select: { id: true },
+    })
     if (nameConflict) {
       return reply.status(409).send({
         success: false,
@@ -777,67 +772,57 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Restore team
-    await db
-      .updateTable('teams')
-      .set({ is_deleted: false, deleted_at: null })
-      .where('id', '=', id)
-      .execute()
+    await prisma.team.update({
+      where: { id },
+      data: { is_deleted: false, deleted_at: null },
+    })
 
     // Restore workspaces and their task_batches that were deleted at the same time
-    const wsIds = await db
-      .selectFrom('workspaces')
-      .select('id')
-      .where('team_id', '=', id)
-      .where('is_deleted', '=', true)
-      .execute()
+    const wsIds = await prisma.workspace.findMany({
+      where: { team_id: id, is_deleted: true },
+      select: { id: true },
+    })
 
     if (wsIds.length > 0) {
-      const wsIdList = wsIds.map(w => w.id)
-      await db
-        .updateTable('workspaces')
-        .set({ is_deleted: false, deleted_at: null })
-        .where('id', 'in', wsIdList)
-        .execute()
+      const wsIdList = wsIds.map((w: typeof wsIds[number]) => w.id)
+      await prisma.workspace.updateMany({
+        where: { id: { in: wsIdList } },
+        data: { is_deleted: false, deleted_at: null },
+      })
 
-      await db
-        .updateTable('task_batches')
-        .set({ is_deleted: false, deleted_at: null })
-        .where('workspace_id', 'in', wsIdList)
-        .where('is_deleted', '=', true)
-        .execute()
+      await prisma.taskBatch.updateMany({
+        where: { workspace_id: { in: wsIdList }, is_deleted: true },
+        data: { is_deleted: false, deleted_at: null },
+      })
     }
 
     // Re-activate suspended members who have no other active teams (this team is their only one)
-    const memberIds = (await db
-      .selectFrom('team_members')
-      .select('user_id')
-      .where('team_id', '=', id)
-      .execute()
-    ).map(m => m.user_id)
+    const memberIds = (await prisma.teamMember.findMany({
+      where: { team_id: id },
+      select: { user_id: true },
+    })).map((m: { user_id: string }) => m.user_id)
 
     if (memberIds.length > 0) {
       // Find suspended members with no other active team
-      const activeCounts = await db
-        .selectFrom('team_members')
-        .innerJoin('teams', 'teams.id', 'team_members.team_id')
-        .select(['team_members.user_id', db.fn.count('team_members.team_id').as('count')])
-        .where('team_members.user_id', 'in', memberIds)
-        .where('teams.is_deleted', '=', false)
-        .where('team_members.team_id', '!=', id)  // exclude restored team itself to find "only this team" members
-        .groupBy('team_members.user_id')
-        .execute()
+      const activeCounts = await prisma.teamMember.groupBy({
+        by: ['user_id'],
+        where: {
+          user_id: { in: memberIds },
+          team: { is_deleted: false },
+          team_id: { not: id }, // exclude restored team itself to find "only this team" members
+        },
+        _count: { team_id: true },
+      })
 
-      const countMap = new Map(activeCounts.map(r => [r.user_id, Number(r.count)]))
+      const countMap = new Map(activeCounts.map((r: typeof activeCounts[number]) => [r.user_id, r._count.team_id]))
       // Members with no OTHER active teams are those suspended because of this deletion
-      const toReactivate = memberIds.filter(uid => (countMap.get(uid) ?? 0) === 0)
+      const toReactivate = memberIds.filter((uid: string) => (countMap.get(uid) ?? 0) === 0)
 
       if (toReactivate.length > 0) {
-        await db
-          .updateTable('users')
-          .set({ status: 'active' })
-          .where('id', 'in', toReactivate)
-          .where('status', '=', 'suspended')
-          .execute()
+        await prisma.user.updateMany({
+          where: { id: { in: toReactivate }, status: 'suspended' },
+          data: { status: 'active' },
+        })
       }
     }
 
@@ -846,43 +831,46 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
 
   // DELETE /admin/trash/teams/:id — permanently delete team and all data
   app.delete<{ Params: { id: string } }>('/admin/trash/teams/:id', async (request, reply) => {
-    const db = getDb()
     const { id } = request.params
 
-    const team = await db
-      .selectFrom('teams')
-      .select('id')
-      .where('id', '=', id)
-      .where('is_deleted', '=', true)
-      .executeTakeFirst()
+    const team = await prisma.team.findFirst({
+      where: { id, is_deleted: true },
+      select: { id: true },
+    })
     if (!team) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '团队不存在或未被删除' } })
 
     // Get workspace IDs
-    const wsIds = (await db.selectFrom('workspaces').select('id').where('team_id', '=', id).execute()).map(w => w.id)
+    const wsIds = (await prisma.workspace.findMany({
+      where: { team_id: id },
+      select: { id: true },
+    })).map((w: { id: string }) => w.id)
 
     if (wsIds.length > 0) {
       // Get task_batch IDs
-      const batchIds = (await db.selectFrom('task_batches').select('id').where('workspace_id', 'in', wsIds).execute()).map(b => b.id)
+      const batchIds = (await prisma.taskBatch.findMany({
+        where: { workspace_id: { in: wsIds } },
+        select: { id: true },
+      })).map((b: { id: string }) => b.id)
 
       if (batchIds.length > 0) {
         // Permanently delete assets
-        await db.deleteFrom('assets').where('batch_id', 'in', batchIds).execute()
+        await prisma.asset.deleteMany({ where: { batch_id: { in: batchIds } } })
         // Permanently delete tasks
-        await db.deleteFrom('tasks').where('batch_id', 'in', batchIds).execute()
+        await prisma.task.deleteMany({ where: { batch_id: { in: batchIds } } })
         // Permanently delete task_batches
-        await db.deleteFrom('task_batches').where('id', 'in', batchIds).execute()
+        await prisma.taskBatch.deleteMany({ where: { id: { in: batchIds } } })
       }
 
       // Delete workspace members
-      await db.deleteFrom('workspace_members').where('workspace_id', 'in', wsIds).execute()
+      await prisma.workspaceMember.deleteMany({ where: { workspace_id: { in: wsIds } } })
       // Delete workspaces
-      await db.deleteFrom('workspaces').where('id', 'in', wsIds).execute()
+      await prisma.workspace.deleteMany({ where: { id: { in: wsIds } } })
     }
 
     // Delete team members
-    await db.deleteFrom('team_members').where('team_id', '=', id).execute()
+    await prisma.teamMember.deleteMany({ where: { team_id: id } })
     // Delete the team (credit_accounts preserved as soft-delete)
-    await db.deleteFrom('teams').where('id', '=', id).execute()
+    await prisma.team.delete({ where: { id } })
 
     return { success: true }
   })
@@ -908,28 +896,23 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       return reply.badRequest('密码必须包含字母和数字')
     }
 
-    const db = getDb()
-    const user = await db
-      .selectFrom('users')
-      .select(['id', 'account'])
-      .where('id', '=', id)
-      .executeTakeFirst()
+    const user = await prisma.user.findUnique({
+      where: { id },
+      select: { id: true, account: true },
+    })
     if (!user) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '用户不存在' } })
 
     const passwordHash = await bcrypt.hash(new_password, 12)
-    await db
-      .updateTable('users')
-      .set({ password_hash: passwordHash })
-      .where('id', '=', id)
-      .execute()
+    await prisma.user.update({
+      where: { id },
+      data: { password_hash: passwordHash },
+    })
 
     // Revoke all refresh tokens so user must re-login
-    await db
-      .updateTable('refresh_tokens')
-      .set({ revoked_at: sql`NOW()` })
-      .where('user_id', '=', id)
-      .where('revoked_at', 'is', null)
-      .execute()
+    await prisma.refreshToken.updateMany({
+      where: { user_id: id, revoked_at: null },
+      data: { revoked_at: new Date() },
+    })
 
     // Optionally clear account lockout from Redis
     if (unlock_account) {
@@ -960,38 +943,32 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     // Sanitize description: truncate and strip HTML
     const description = rawDesc ? stripHtml(rawDesc).slice(0, 200) : undefined
 
-    const db = getDb()
-
-    const creditAccount = await db
-      .selectFrom('credit_accounts')
-      .select(['id', 'balance', 'frozen_credits'])
-      .where('team_id', '=', request.params.id)
-      .where('owner_type', '=', 'team')
-      .executeTakeFirst()
+    const creditAccount = await prisma.creditAccount.findFirst({
+      where: { team_id: request.params.id, owner_type: 'team' },
+      select: { id: true, balance: true, frozen_credits: true },
+    })
 
     if (!creditAccount) return reply.notFound('Team credit account not found')
 
     if (amount > 0) {
       // Top-up
-      await db
-        .updateTable('credit_accounts')
-        .set({
-          balance: sql`balance + ${amount}`,
-          total_earned: sql`total_earned + ${amount}`,
-        })
-        .where('id', '=', creditAccount.id)
-        .execute()
+      await prisma.creditAccount.update({
+        where: { id: creditAccount.id },
+        data: {
+          balance: { increment: amount },
+          total_earned: { increment: amount },
+        },
+      })
 
-      await db
-        .insertInto('credits_ledger')
-        .values({
+      await prisma.creditsLedger.create({
+        data: {
           credit_account_id: creditAccount.id,
           user_id: request.user.id,
           amount,
           type: 'topup',
           description: description ?? 'Admin top-up',
-        })
-        .execute()
+        },
+      })
     } else {
       // Deduction (amount is negative)
       const deduction = Math.abs(amount)
@@ -1000,60 +977,54 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         return reply.badRequest('可扣减余额不足，请检查当前余额和冻结金额')
       }
 
-      await db
-        .updateTable('credit_accounts')
-        .set({
-          balance: sql`balance - ${deduction}`,
-          total_spent: sql`total_spent + ${deduction}`,
-        })
-        .where('id', '=', creditAccount.id)
-        .execute()
+      await prisma.creditAccount.update({
+        where: { id: creditAccount.id },
+        data: {
+          balance: { decrement: deduction },
+          total_spent: { increment: deduction },
+        },
+      })
 
-      await db
-        .insertInto('credits_ledger')
-        .values({
+      await prisma.creditsLedger.create({
+        data: {
           credit_account_id: creditAccount.id,
           user_id: request.user.id,
           amount,
           type: 'refund',
           description: description ?? 'Admin deduction',
-        })
-        .execute()
+        },
+      })
     }
 
-    const updated = await db
-      .selectFrom('credit_accounts')
-      .select(['balance', 'frozen_credits', 'total_earned', 'total_spent'])
-      .where('id', '=', creditAccount.id)
-      .executeTakeFirstOrThrow()
+    const updated = await prisma.creditAccount.findUnique({
+      where: { id: creditAccount.id },
+      select: { balance: true, frozen_credits: true, total_earned: true, total_spent: true },
+    })
 
     return updated
   })
 
   // GET /admin/users — list all users with credit usage
   app.get('/admin/users', async () => {
-    const db = getDb()
-    const users = await db
-      .selectFrom('users')
-      .select(['id', 'account', 'username', 'avatar_url', 'role', 'status', 'created_at'])
-      .orderBy('created_at', 'desc')
-      .execute()
+    const users = await prisma.user.findMany({
+      select: { id: true, account: true, username: true, avatar_url: true, role: true, status: true, created_at: true },
+      orderBy: { created_at: 'desc' },
+    })
 
     // Get credit usage per user from team_members (current period) + ledger (lifetime)
-    const userIds = users.map(u => u.id)
+    const userIds = users.map((u: typeof users[number]) => u.id)
     const creditUsageMap = new Map<string, { total_quota: number | null; total_used: number }>()
     const lifetimeUsageMap = new Map<string, number>()
 
     if (userIds.length > 0) {
-      const memberRows = await db
-        .selectFrom('team_members')
-        .select(['user_id', 'credit_quota', 'credit_used'])
-        .where('user_id', 'in', userIds)
-        .execute()
+      const memberRows = await prisma.teamMember.findMany({
+        where: { user_id: { in: userIds } },
+        select: { user_id: true, credit_quota: true, credit_used: true },
+      })
 
       for (const m of memberRows) {
         const existing = creditUsageMap.get(m.user_id)
-        const used = (m.credit_used ?? 0)
+        const used = m.credit_used ?? 0
         const quota = m.credit_quota
         if (existing) {
           existing.total_used += used
@@ -1069,17 +1040,15 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       }
 
       // Lifetime usage from ledger: sum of all 'confirm' debits per user
-      const ledgerRows = await db
-        .selectFrom('credits_ledger')
-        .select(['user_id', db.fn.sum('amount').as('total')])
-        .where('user_id', 'in', userIds)
-        .where('type', '=', 'confirm')
-        .groupBy('user_id')
-        .execute()
+      const ledgerRows = await prisma.creditsLedger.groupBy({
+        by: ['user_id'],
+        where: { user_id: { in: userIds }, type: 'confirm' },
+        _sum: { amount: true },
+      })
 
       for (const r of ledgerRows) {
         // confirm entries have negative amounts, so negate to get positive usage
-        lifetimeUsageMap.set(r.user_id, Math.abs(Number(r.total ?? 0)))
+        lifetimeUsageMap.set(r.user_id, Math.abs(r._sum.amount ?? 0))
       }
     }
 
@@ -1088,16 +1057,13 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     const teamIdMap = new Map<string, string>()
     const priorityBoostMap = new Map<string, boolean>()
     if (userIds.length > 0) {
-      const teamRows = await db
-        .selectFrom('team_members')
-        .innerJoin('teams', 'teams.id', 'team_members.team_id')
-        .select(['team_members.user_id', 'team_members.team_id', 'team_members.priority_boost', 'teams.name'])
-        .where('team_members.user_id', 'in', userIds)
-        .where('teams.is_deleted', '=', false)
-        .execute()
+      const teamRows = await prisma.teamMember.findMany({
+        where: { user_id: { in: userIds }, team: { is_deleted: false } },
+        select: { user_id: true, team_id: true, priority_boost: true, team: { select: { name: true } } },
+      })
       for (const r of teamRows) {
         const list = teamMap.get(r.user_id) ?? []
-        list.push(r.name)
+        list.push(r.team.name)
         teamMap.set(r.user_id, list)
         // Store first team_id and priority_boost (most users belong to one team)
         if (!teamIdMap.has(r.user_id)) {
@@ -1108,7 +1074,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     }
 
     return {
-      data: users.map(u => ({
+      data: users.map((u: typeof users[number]) => ({
         ...u,
         credit_used: creditUsageMap.get(u.id)?.total_used ?? 0,
         credit_quota: creditUsageMap.get(u.id)?.total_quota ?? null,
@@ -1122,28 +1088,28 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
 
   // GET /admin/batches — all generation records (kept for backwards compat)
   app.get<{ Querystring: { team_id?: string; workspace_id?: string; cursor?: string; limit?: string } }>('/admin/batches', async (request, reply) => {
-    const db = getDb()
     const limit = Math.min(parseInt(request.query.limit ?? '20', 10), 100)
 
-    let query = db
-      .selectFrom('task_batches')
-      .selectAll()
-      .orderBy('created_at', 'desc')
-      .limit(limit + 1)
+    const where: Record<string, unknown> = {}
 
     if (request.query.team_id) {
-      query = query.where('team_id', '=', request.query.team_id)
+      where.team_id = request.query.team_id
     }
     if (request.query.workspace_id) {
-      query = query.where('workspace_id', '=', request.query.workspace_id)
+      where.workspace_id = request.query.workspace_id
     }
     if (request.query.cursor) {
       const cursorDate = new Date(request.query.cursor)
       if (isNaN(cursorDate.getTime())) return reply.badRequest('Invalid cursor')
-      query = query.where('created_at', '<', cursorDate as any)
+      where.created_at = { lt: cursorDate }
     }
 
-    const rows = await query.execute()
+    const rows = await prisma.taskBatch.findMany({
+      where,
+      orderBy: { created_at: 'desc' },
+      take: limit + 1,
+    })
+
     const hasMore = rows.length > limit
     const data = hasMore ? rows.slice(0, limit) : rows
 
@@ -1157,84 +1123,65 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Querystring: { limit?: string; since?: string } }>(
     '/admin/errors',
     async (request) => {
-      const db = getDb()
       const limit = Math.min(parseInt(request.query.limit ?? '50', 10), 200)
       const sinceMs = parseInt(request.query.since ?? String(7 * 24 * 60 * 60 * 1000), 10)
       const since = new Date(Date.now() - sinceMs)
 
       // Recent failed tasks across all users
-      const failedTasks = await db
-        .selectFrom('tasks')
-        .innerJoin('task_batches', 'task_batches.id', 'tasks.batch_id')
-        .innerJoin('users', 'users.id', 'tasks.user_id')
-        .select([
-          'tasks.id as task_id',
-          'tasks.batch_id',
-          'tasks.error_message',
-          'tasks.retry_count',
-          'tasks.completed_at',
-          'task_batches.module',
-          'task_batches.provider',
-          'task_batches.model',
-          'task_batches.prompt',
-          'task_batches.canvas_id',
-          'task_batches.created_at as submitted_at',
-          'users.id as user_id',
-          'users.username',
-          'users.account',
-        ])
-        .where('tasks.status', '=', 'failed')
-        .where('task_batches.created_at', '>=', since as any)
-        .orderBy('task_batches.created_at', 'desc')
-        .limit(limit)
-        .execute()
+      const failedTasks = await prisma.task.findMany({
+        where: {
+          status: 'failed',
+          batch: { created_at: { gte: since } },
+        },
+        include: {
+          batch: {
+            select: {
+              module: true,
+              provider: true,
+              model: true,
+              prompt: true,
+              canvas_id: true,
+              created_at: true,
+            },
+          },
+          user: {
+            select: { id: true, username: true, account: true },
+          },
+        },
+        orderBy: { batch: { created_at: 'desc' } },
+        take: limit,
+      })
 
       // Recent AI assistant errors across all users
-      const aiErrors = await db
-        .selectFrom('ai_assistant_errors')
-        .innerJoin('users', 'users.id', 'ai_assistant_errors.user_id')
-        .select([
-          'ai_assistant_errors.id',
-          'ai_assistant_errors.http_status',
-          'ai_assistant_errors.error_detail',
-          'ai_assistant_errors.created_at',
-          'users.id as user_id',
-          'users.username',
-          'users.account',
-        ])
-        .where('ai_assistant_errors.created_at', '>=', since as any)
-        .orderBy('ai_assistant_errors.created_at', 'desc')
-        .limit(limit)
-        .execute()
+      const aiErrors = await prisma.aiAssistantError.findMany({
+        where: { created_at: { gte: since } },
+        include: {
+          user: {
+            select: { id: true, username: true, account: true },
+          },
+        },
+        orderBy: { created_at: 'desc' },
+        take: limit,
+      })
 
       // Recent submission errors across all users
-      const submissionErrors = await db
-        .selectFrom('submission_errors')
-        .innerJoin('users', 'users.id', 'submission_errors.user_id')
-        .select([
-          'submission_errors.id',
-          'submission_errors.source',
-          'submission_errors.error_code',
-          'submission_errors.http_status',
-          'submission_errors.detail',
-          'submission_errors.model',
-          'submission_errors.canvas_id',
-          'submission_errors.created_at',
-          'users.id as user_id',
-          'users.username',
-          'users.account',
-        ])
-        .where('submission_errors.created_at', '>=', since as any)
-        .orderBy('submission_errors.created_at', 'desc')
-        .limit(limit)
-        .execute()
+      const submissionErrors = await prisma.submissionError.findMany({
+        where: { created_at: { gte: since } },
+        include: {
+          user: {
+            select: { id: true, username: true, account: true },
+          },
+        },
+        orderBy: { created_at: 'desc' },
+        take: limit,
+      })
 
       // Error frequency summary: group failed tasks + submission errors
       const errorGroups = new Map<string, { count: number; last_seen: string; example: string }>()
       for (const t of failedTasks) {
         const key = (t.error_message ?? '（无错误信息）').slice(0, 120)
         const existing = errorGroups.get(key)
-        const ts = t.submitted_at instanceof Date ? t.submitted_at.toISOString() : String(t.submitted_at)
+        const ts = t.batch.created_at instanceof Date ? t.batch.created_at.toISOString() : String(t.batch.created_at)
         if (!existing) {
           errorGroups.set(key, { count: 1, last_seen: ts, example: key })
         } else {
@@ -1259,19 +1206,43 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         .map(([message, stats]) => ({ message, ...stats }))
 
       return {
-        failed_tasks: failedTasks.map(t => ({
-          ...t,
-          source: t.canvas_id ? 'canvas' : 'generation',
-          submitted_at: t.submitted_at instanceof Date ? t.submitted_at.toISOString() : String(t.submitted_at),
-          completed_at: t.completed_at instanceof Date ? t.completed_at.toISOString() : (t.completed_at ? String(t.completed_at) : null),
+        failed_tasks: failedTasks.map((t: typeof failedTasks[number]) => ({
+          task_id: t.id,
+          batch_id: t.batch_id,
+          error_message: t.error_message,
+          retry_count: t.retry_count,
+          completed_at: t.completed_at,
+          source: t.batch.canvas_id ? 'canvas' : 'generation',
+          submitted_at: t.batch.created_at instanceof Date ? t.batch.created_at.toISOString() : String(t.batch.created_at),
+          module: t.batch.module,
+          provider: t.batch.provider,
+          model: t.batch.model,
+          prompt: t.batch.prompt,
+          user_id: t.user.id,
+          username: t.user.username,
+          account: t.user.account,
         })),
-        ai_errors: aiErrors.map(e => ({
-          ...e,
+        ai_errors: aiErrors.map((e: typeof aiErrors[number]) => ({
+          id: e.id,
+          http_status: e.http_status,
+          error_detail: e.error_detail,
           created_at: e.created_at instanceof Date ? e.created_at.toISOString() : String(e.created_at),
+          user_id: e.user.id,
+          username: e.user.username,
+          account: e.user.account,
         })),
-        submission_errors: submissionErrors.map(e => ({
-          ...e,
+        submission_errors: submissionErrors.map((e: typeof submissionErrors[number]) => ({
+          id: e.id,
+          source: e.source,
+          error_code: e.error_code,
+          http_status: e.http_status,
+          detail: e.detail,
+          model: e.model,
+          canvas_id: e.canvas_id,
           created_at: e.created_at instanceof Date ? e.created_at.toISOString() : String(e.created_at),
+          user_id: e.user.id,
+          username: e.user.username,
+          account: e.user.account,
         })),
         top_errors: topErrors,
         since: since.toISOString(),
@@ -1284,79 +1255,85 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: { id: string }; Querystring: { limit?: string } }>(
     '/admin/users/:id/diagnosis',
     async (request, reply) => {
-      const db = getDb()
       const userId = request.params.id
       const limit = Math.min(parseInt(request.query.limit ?? '30', 10), 100)
 
       // Verify user exists
-      const user = await db
-        .selectFrom('users')
-        .select(['id', 'username', 'account', 'email', 'phone', 'status'])
-        .where('id', '=', userId)
-        .executeTakeFirst()
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { id: true, username: true, account: true, email: true, phone: true, status: true },
+      })
       if (!user) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '用户不存在' } })
 
       // Failed tasks with batch info (raw error_message, source: canvas or generation)
-      const failedTasks = await db
-        .selectFrom('tasks')
-        .innerJoin('task_batches', 'task_batches.id', 'tasks.batch_id')
-        .select([
-          'tasks.id as task_id',
-          'tasks.batch_id',
-          'tasks.error_message',
-          'tasks.status as task_status',
-          'tasks.retry_count',
-          'tasks.completed_at',
-          'task_batches.module',
-          'task_batches.provider',
-          'task_batches.model',
-          'task_batches.prompt',
-          'task_batches.status as batch_status',
-          'task_batches.canvas_id',
-          'task_batches.canvas_node_id',
-          'task_batches.created_at as submitted_at',
-        ])
-        .where('tasks.user_id', '=', userId)
-        .where('tasks.status', '=', 'failed')
-        .orderBy('task_batches.created_at', 'desc')
-        .limit(limit)
-        .execute()
+      const failedTasks = await prisma.task.findMany({
+        where: { user_id: userId, status: 'failed' },
+        include: {
+          batch: {
+            select: {
+              module: true,
+              provider: true,
+              model: true,
+              prompt: true,
+              status: true,
+              canvas_id: true,
+              canvas_node_id: true,
+              created_at: true,
+            },
+          },
+        },
+        orderBy: { batch: { created_at: 'desc' } },
+        take: limit,
+      })
 
       // AI assistant errors (last 7 days)
       const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-      const aiErrors = await db
-        .selectFrom('ai_assistant_errors')
-        .select(['id', 'http_status', 'error_detail', 'created_at'])
-        .where('user_id', '=', userId)
-        .where('created_at', '>=', since7d as any)
-        .orderBy('created_at', 'desc')
-        .limit(limit)
-        .execute()
+      const aiErrors = await prisma.aiAssistantError.findMany({
+        where: { user_id: userId, created_at: { gte: since7d } },
+        orderBy: { created_at: 'desc' },
+        take: limit,
+      })
 
       // Submission errors (last 7 days)
-      const submissionErrors = await db
-        .selectFrom('submission_errors')
-        .select(['id', 'source', 'error_code', 'http_status', 'detail', 'model', 'canvas_id', 'created_at'])
-        .where('user_id', '=', userId)
-        .where('created_at', '>=', since7d as any)
-        .orderBy('created_at', 'desc')
-        .limit(limit)
-        .execute()
+      const submissionErrors = await prisma.submissionError.findMany({
+        where: { user_id: userId, created_at: { gte: since7d } },
+        orderBy: { created_at: 'desc' },
+        take: limit,
+      })
 
       return {
         user,
-        failed_tasks: failedTasks.map(t => ({
-          ...t,
-          source: t.canvas_id ? 'canvas' : 'generation',
-          submitted_at: t.submitted_at instanceof Date ? t.submitted_at.toISOString() : String(t.submitted_at),
-          completed_at: t.completed_at instanceof Date ? t.completed_at.toISOString() : (t.completed_at ? String(t.completed_at) : null),
+        failed_tasks: failedTasks.map((t: typeof failedTasks[number]) => ({
+          task_id: t.id,
+          batch_id: t.batch_id,
+          error_message: t.error_message,
+          task_status: t.status,
+          retry_count: t.retry_count,
+          completed_at: t.completed_at,
+          source: t.batch.canvas_id ? 'canvas' : 'generation',
+          submitted_at: t.batch.created_at instanceof Date ? t.batch.created_at.toISOString() : String(t.batch.created_at),
+          module: t.batch.module,
+          provider: t.batch.provider,
+          model: t.batch.model,
+          prompt: t.batch.prompt,
+          batch_status: t.batch.status,
+          canvas_id: t.batch.canvas_id,
+          canvas_node_id: t.batch.canvas_node_id,
         })),
-        ai_assistant_errors: aiErrors.map(e => ({
-          ...e,
+        ai_assistant_errors: aiErrors.map((e: typeof aiErrors[number]) => ({
+          id: e.id,
+          http_status: e.http_status,
+          error_detail: e.error_detail,
           created_at: e.created_at instanceof Date ? e.created_at.toISOString() : String(e.created_at),
         })),
-        submission_errors: submissionErrors.map(e => ({
-          ...e,
+        submission_errors: submissionErrors.map((e: typeof submissionErrors[number]) => ({
+          id: e.id,
+          source: e.source,
+          error_code: e.error_code,
+          http_status: e.http_status,
+          detail: e.detail,
+          model: e.model,
+          canvas_id: e.canvas_id,
           created_at: e.created_at instanceof Date ? e.created_at.toISOString() : String(e.created_at),
         })),
       }

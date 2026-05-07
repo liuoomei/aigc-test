@@ -5,7 +5,7 @@ import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
 import multipart from '@fastify/multipart'
-import Redis from 'ioredis'
+import { Redis } from 'ioredis'
 import { jwtAuthPlugin } from './plugins/jwt-auth.js'
 import { prisma } from './lib/prisma.js'
 import { healthzRoutes } from './routes/healthz.js'
@@ -121,7 +121,7 @@ export async function buildApp() {
   )
 
   // 全局错误处理
-  app.setErrorHandler((error, request, reply) => {
+  app.setErrorHandler((error: Error & { validation?: unknown; statusCode?: number; code?: string }, request, reply) => {
     app.log.error(error)
 
     if (error.validation) {
@@ -132,11 +132,11 @@ export async function buildApp() {
       })
     }
 
-    const statusCode = error.statusCode ?? 500
+    const statusCode = (error as { statusCode?: number }).statusCode ?? 500
     return reply.status(statusCode).send({
       statusCode,
       success: false,
-      error: { code: error.code ?? 'INTERNAL_ERROR', message: error.message },
+      error: { code: (error as { code?: string }).code ?? 'INTERNAL_ERROR', message: error.message },
     })
   })
 

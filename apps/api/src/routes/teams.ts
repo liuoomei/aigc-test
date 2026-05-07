@@ -1,6 +1,5 @@
 import type { FastifyInstance } from 'fastify'
-import { getDb } from '@aigc/db'
-import { sql } from 'kysely'
+import { prisma } from '../lib/prisma.js'
 import crypto from 'node:crypto'
 import bcrypt from 'bcryptjs'
 import { teamRoleGuard } from '../plugins/guards.js'
@@ -38,33 +37,72 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
     preHandler: teamRoleGuard('editor'),
     config: { rateLimit: false },
   }, async (request) => {
-    const db = getDb()
-    const team = await db
-      .selectFrom('teams')
-      .select(['id', 'name', 'owner_id', 'plan_tier', 'created_at', 'allow_member_topup'])
-      .where('id', '=', request.params.id)
-      .executeTakeFirstOrThrow()
+    const team = await prisma.team.findUniqueOrThrow({
+      where: { id: request.params.id },
+      select: {
+        id: true,
+        name: true,
+        owner_id: true,
+        plan_tier: true,
+        created_at: true,
+        allow_member_topup: true,
+      },
+    })
 
-    const members = await db
-      .selectFrom('team_members')
-      .innerJoin('users', 'users.id', 'team_members.user_id')
-      .select([
-        'users.id as user_id', 'users.account', 'users.username', 'users.avatar_url',
-        'team_members.role', 'team_members.credit_quota', 'team_members.credit_used',
-        'team_members.quota_period', 'team_members.quota_reset_at', 'team_members.joined_at',
-        'team_members.priority_boost',
-      ])
-      .where('team_members.team_id', '=', request.params.id)
-      .execute()
+    const members = await prisma.teamMember.findMany({
+      where: { team_id: request.params.id },
+      select: {
+        role: true,
+        credit_quota: true,
+        credit_used: true,
+        quota_period: true,
+        quota_reset_at: true,
+        joined_at: true,
+        priority_boost: true,
+        user: {
+          select: {
+            id: true,
+            account: true,
+            username: true,
+            avatar_url: true,
+          },
+        },
+      },
+    })
 
-    const creditAccount = await db
-      .selectFrom('credit_accounts')
-      .select(['balance', 'frozen_credits', 'total_earned', 'total_spent'])
-      .where('owner_type', '=', 'team')
-      .where('team_id', '=', request.params.id)
-      .executeTakeFirst()
+    // 转换成员数据格式以保持向后兼容
+    const formattedMembers = members.map((m) => ({
+      user_id: m.user.id,
+      account: m.user.account,
+      username: m.user.username,
+      avatar_url: m.user.avatar_url,
+      role: m.role,
+      credit_quota: m.credit_quota,
+      credit_used: m.credit_used,
+      quota_period: m.quota_period,
+      quota_reset_at: m.quota_reset_at,
+      joined_at: m.joined_at,
+      priority_boost: m.priority_boost,
+    }))
 
-    return { ...team, members, credits: creditAccount ?? { balance: 0, frozen_credits: 0, total_earned: 0, total_spent: 0 } }
+    const creditAccount = await prisma.creditAccount.findFirst({
+      where: {
+        team_id: request.params.id,
+        owner_type: 'team',
+      },
+      select: {
+        balance: true,
+        frozen_credits: true,
+        total_earned: true,
+        total_spent: true,
+      },
+    })
+
+    return {
+      ...team,
+      members: formattedMembers,
+      credits: creditAccount ?? { balance: 0, frozen_credits: 0, total_earned: 0, total_spent: 0 },
+    }
   })
 
   // POST /teams/:id/members — invite member by email or phone
@@ -99,51 +137,44 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
 
     const memberRole: TeamMemberRole = (role as TeamMemberRole) ?? 'editor'
 
-    const db = getDb()
     const teamId = request.params.id
 
     // Resolve target workspace
     let targetWsId: string | null = null
     if (new_workspace_name) {
-      const ws = await db
-        .insertInto('workspaces')
-        .values({
+      const ws = await prisma.workspace.create({
+        data: {
           team_id: teamId,
           name: new_workspace_name,
           created_by: request.user.id,
-        })
-        .returning('id')
-        .executeTakeFirstOrThrow()
+        },
+        select: { id: true },
+      })
       targetWsId = ws.id
 
       // Add the owner to the new workspace too
-      await db
-        .insertInto('workspace_members')
-        .values({
+      await prisma.workspaceMember.create({
+        data: {
           workspace_id: targetWsId,
           user_id: request.user.id,
           role: 'admin',
-        })
-        .execute()
+        },
+      })
     } else if (workspace_id) {
       // Verify workspace belongs to this team
-      const ws = await db
-        .selectFrom('workspaces')
-        .select('id')
-        .where('id', '=', workspace_id)
-        .where('team_id', '=', teamId)
-        .executeTakeFirst()
+      const ws = await prisma.workspace.findFirst({
+        where: { id: workspace_id, team_id: teamId },
+        select: { id: true },
+      })
       if (!ws) return reply.badRequest('工作区不存在或不属于此团队')
       targetWsId = ws.id
     }
 
     // Check if user already exists
-    let user = await db
-      .selectFrom('users')
-      .select(['id', 'email', 'phone'])
-      .$if(!!email, (qb) => qb.where('email', '=', email!))
-      .$if(!email && !!phone, (qb) => qb.where('phone', '=', phone!))
-      .executeTakeFirst()
+    let user = await prisma.user.findFirst({
+      where: email ? { email } : { phone },
+      select: { id: true, email: true, phone: true },
+    })
 
     const identifier = email ?? phone!
 
@@ -151,9 +182,8 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
       // Create placeholder user
       const account = identifier
       const username = email ? email.split('@')[0] : phone!.slice(-4)
-      const result = await db
-        .insertInto('users')
-        .values({
+      const result = await prisma.user.create({
+        data: {
           account,
           email: email ?? null,
           phone: phone ?? null,
@@ -162,49 +192,43 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
           role: 'member',
           status: 'suspended',  // inactive until invite accepted
           plan_tier: 'free',
-        })
-        .returning('id')
-        .executeTakeFirstOrThrow()
+        },
+        select: { id: true },
+      })
       user = { id: result.id, email: email ?? null, phone: phone ?? null }
     }
 
     // Check if already a team member
-    const existing = await db
-      .selectFrom('team_members')
-      .select('user_id')
-      .where('team_id', '=', teamId)
-      .where('user_id', '=', user.id)
-      .executeTakeFirst()
+    const existing = await prisma.teamMember.findFirst({
+      where: { team_id: teamId, user_id: user.id },
+      select: { user_id: true },
+    })
 
     if (existing) {
       // If user hasn't accepted invite yet (suspended), allow regenerating the invite
-      const targetUser = await db
-        .selectFrom('users')
-        .select(['id', 'status'])
-        .where('id', '=', user.id)
-        .executeTakeFirst()
+      const targetUser = await prisma.user.findFirst({
+        where: { id: user.id },
+        select: { id: true, status: true },
+      })
 
       if (targetUser?.status === 'suspended') {
         // Invalidate old invite tokens before creating a new one
-        await db
-          .updateTable('email_verifications')
-          .set({ used_at: sql`NOW()` })
-          .where('user_id', '=', user.id)
-          .where('used_at', 'is', null)
-          .execute()
+        await prisma.emailVerification.updateMany({
+          where: { user_id: user.id, used_at: null },
+          data: { used_at: new Date() },
+        })
 
         const inviteToken = crypto.randomBytes(32).toString('hex')
         const tokenHash = crypto.createHash('sha256').update(inviteToken).digest('hex')
 
-        await db
-          .insertInto('email_verifications')
-          .values({
+        await prisma.emailVerification.create({
+          data: {
             user_id: user.id,
             token_hash: tokenHash,
             type: 'verify_email',
-            expires_at: sql`NOW() + INTERVAL '7 days'`,
-          })
-          .execute()
+            expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
+          },
+        })
 
         return reply.status(200).send({
           user_id: user.id,
@@ -223,41 +247,38 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Add to team
-    await db
-      .insertInto('team_members')
-      .values({
+    await prisma.teamMember.create({
+      data: {
         team_id: teamId,
         user_id: user.id,
         role: memberRole,
         credit_quota: 1000,
-      })
-      .execute()
+      },
+    })
 
     // Add to workspace
     if (targetWsId) {
-      await db
-        .insertInto('workspace_members')
-        .values({
+      await prisma.workspaceMember.create({
+        data: {
           workspace_id: targetWsId,
           user_id: user.id,
           role: memberRole === 'owner' ? 'admin' : memberRole === 'viewer' ? 'viewer' : 'editor',
-        })
-        .execute()
+        },
+      })
     }
 
     // Create invite token
     const inviteToken = crypto.randomBytes(32).toString('hex')
     const tokenHash = crypto.createHash('sha256').update(inviteToken).digest('hex')
 
-    await db
-      .insertInto('email_verifications')
-      .values({
+    await prisma.emailVerification.create({
+      data: {
         user_id: user.id,
         token_hash: tokenHash,
         type: 'verify_email',
-        expires_at: sql`NOW() + INTERVAL '7 days'`,
-      })
-      .execute()
+        expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
+      },
+    })
 
     return reply.status(201).send({
       user_id: user.id,
@@ -295,7 +316,6 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
   }, async (request, reply) => {
     const { identifier: rawIdentifier, role = 'editor', credit_quota = 1000, default_password } = request.body
     const teamId = request.params.id
-    const db = getDb()
 
     const identifier = rawIdentifier.trim()
     if (!identifier) {
@@ -311,21 +331,17 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Check if user already exists
-    const existingUser = await db
-      .selectFrom('users')
-      .select(['id', 'account'])
-      .$if(isEmail, (qb) => qb.where('email', '=', identifier))
-      .$if(isPhone, (qb) => qb.where('phone', '=', identifier))
-      .executeTakeFirst()
+    const existingUser = await prisma.user.findFirst({
+      where: isEmail ? { email: identifier } : { phone: identifier },
+      select: { id: true, account: true },
+    })
 
     if (existingUser) {
       // Check if already a team member
-      const isMember = await db
-        .selectFrom('team_members')
-        .select('user_id')
-        .where('team_id', '=', teamId)
-        .where('user_id', '=', existingUser.id)
-        .executeTakeFirst()
+      const isMember = await prisma.teamMember.findFirst({
+        where: { team_id: teamId, user_id: existingUser.id },
+        select: { user_id: true },
+      })
 
       if (isMember) {
         return reply.status(409).send({
@@ -340,11 +356,10 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
     let username = baseUsername
     let suffix = 1
     while (true) {
-      const existing = await db
-        .selectFrom('users')
-        .select('id')
-        .where('username', '=', username)
-        .executeTakeFirst()
+      const existing = await prisma.user.findFirst({
+        where: { username },
+        select: { id: true },
+      })
       if (!existing) break
       username = `${baseUsername}_${suffix++}`
     }
@@ -355,9 +370,8 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
     // Create user if not exists
     let userId: string
     if (!existingUser) {
-      const newUser = await db
-        .insertInto('users')
-        .values({
+      const newUser = await prisma.user.create({
+        data: {
           account: identifier,
           email: isEmail ? identifier : null,
           phone: isPhone ? identifier : null,
@@ -367,57 +381,53 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
           status: 'active',
           plan_tier: 'free',
           password_change_required: true,
-        })
-        .returning('id')
-        .executeTakeFirstOrThrow()
+        },
+        select: { id: true },
+      })
       userId = newUser.id
     } else {
       userId = existingUser.id
     }
 
     // Add to team
-    await db
-      .insertInto('team_members')
-      .values({
+    await prisma.teamMember.create({
+      data: {
         team_id: teamId,
         user_id: userId,
         role,
         credit_quota,
-      })
-      .execute()
+      },
+    })
 
     // Create personal workspace
     const workspaceName = `${username}工作区`
-    const workspace = await db
-      .insertInto('workspaces')
-      .values({
+    const workspace = await prisma.workspace.create({
+      data: {
         team_id: teamId,
         name: workspaceName,
         created_by: request.user.id,
-      })
-      .returning('id')
-      .executeTakeFirstOrThrow()
+      },
+      select: { id: true },
+    })
 
     // Add user to workspace
     const wsRole = role === 'viewer' ? 'viewer' : 'editor'
-    await db
-      .insertInto('workspace_members')
-      .values({
+    await prisma.workspaceMember.create({
+      data: {
         workspace_id: workspace.id,
         user_id: userId,
         role: wsRole,
-      })
-      .execute()
+      },
+    })
 
     // Also add owner to workspace as admin
-    await db
-      .insertInto('workspace_members')
-      .values({
+    await prisma.workspaceMember.create({
+      data: {
         workspace_id: workspace.id,
         user_id: request.user.id,
         role: 'admin',
-      })
-      .execute()
+      },
+    })
 
     return reply.status(201).send({
       user_id: userId,
@@ -460,7 +470,6 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
   }, async (request, reply) => {
     const { identifiers, role = 'editor', credit_quota = 1000, default_password } = request.body
     const teamId = request.params.id
-    const db = getDb()
 
     // Hash password once for all users
     const passwordHash = await bcrypt.hash(default_password, 10)
@@ -485,11 +494,10 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
       let username = baseUsername
       let suffix = 1
       while (true) {
-        const existing = await db
-          .selectFrom('users')
-          .select('id')
-          .where('username', '=', username)
-          .executeTakeFirst()
+        const existing = await prisma.user.findFirst({
+          where: { username },
+          select: { id: true },
+        })
         if (!existing) return username
         username = `${baseUsername}_${suffix++}`
       }
@@ -516,21 +524,17 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
         }
 
         // Check if user already exists
-        let existingUser = await db
-          .selectFrom('users')
-          .select(['id', 'account'])
-          .$if(isEmail, (qb) => qb.where('email', '=', identifier))
-          .$if(isPhone, (qb) => qb.where('phone', '=', identifier))
-          .executeTakeFirst()
+        let existingUser = await prisma.user.findFirst({
+          where: isEmail ? { email: identifier } : { phone: identifier },
+          select: { id: true, account: true },
+        })
 
         if (existingUser) {
           // Check if already a team member
-          const isMember = await db
-            .selectFrom('team_members')
-            .select('user_id')
-            .where('team_id', '=', teamId)
-            .where('user_id', '=', existingUser.id)
-            .executeTakeFirst()
+          const isMember = await prisma.teamMember.findFirst({
+            where: { team_id: teamId, user_id: existingUser.id },
+            select: { user_id: true },
+          })
 
           if (isMember) {
             results.push({ identifier, status: 'exists', user_id: existingUser.id, error: '已是团队成员' })
@@ -546,9 +550,8 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
         // Create user if not exists
         let userId: string
         if (!existingUser) {
-          const newUser = await db
-            .insertInto('users')
-            .values({
+          const newUser = await prisma.user.create({
+            data: {
               account: identifier,
               email: isEmail ? identifier : null,
               phone: isPhone ? identifier : null,
@@ -558,57 +561,53 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
               status: 'active',
               plan_tier: 'free',
               password_change_required: true,
-            })
-            .returning('id')
-            .executeTakeFirstOrThrow()
+            },
+            select: { id: true },
+          })
           userId = newUser.id
         } else {
           userId = existingUser.id
         }
 
         // Add to team
-        await db
-          .insertInto('team_members')
-          .values({
+        await prisma.teamMember.create({
+          data: {
             team_id: teamId,
             user_id: userId,
             role,
             credit_quota,
-          })
-          .execute()
+          },
+        })
 
         // Create personal workspace
         const workspaceName = `${username}工作区`
-        const workspace = await db
-          .insertInto('workspaces')
-          .values({
+        const workspace = await prisma.workspace.create({
+          data: {
             team_id: teamId,
             name: workspaceName,
             created_by: request.user.id,
-          })
-          .returning('id')
-          .executeTakeFirstOrThrow()
+          },
+          select: { id: true },
+        })
 
         // Add user to workspace
         const wsRole = role === 'viewer' ? 'viewer' : 'editor'
-        await db
-          .insertInto('workspace_members')
-          .values({
+        await prisma.workspaceMember.create({
+          data: {
             workspace_id: workspace.id,
             user_id: userId,
             role: wsRole,
-          })
-          .execute()
+          },
+        })
 
         // Also add owner to workspace as admin
-        await db
-          .insertInto('workspace_members')
-          .values({
+        await prisma.workspaceMember.create({
+          data: {
             workspace_id: workspace.id,
             user_id: request.user.id,
             role: 'admin',
-          })
-          .execute()
+          },
+        })
 
         results.push({
           identifier,
@@ -654,7 +653,6 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
       return reply.badRequest('quota_period must be "weekly", "monthly", or null')
     }
 
-    const db = getDb()
     const updates: Record<string, unknown> = {}
     if (role !== undefined) updates.role = role
     if (credit_quota !== undefined) updates.credit_quota = credit_quota
@@ -674,12 +672,15 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    await db
-      .updateTable('team_members')
-      .set(updates)
-      .where('team_id', '=', request.params.id)
-      .where('user_id', '=', request.params.uid)
-      .execute()
+    await prisma.teamMember.update({
+      where: {
+        team_id_user_id: {
+          team_id: request.params.id,
+          user_id: request.params.uid,
+        },
+      },
+      data: updates,
+    })
 
     return { success: true }
   })
@@ -689,14 +690,16 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
     preHandler: teamRoleGuard('owner'),
     config: { rateLimit: false },
   }, async (request, reply) => {
-    const db = getDb()
-
-    const member = await db
-      .selectFrom('team_members')
-      .select(['credit_used', 'quota_period'])
-      .where('team_id', '=', request.params.id)
-      .where('user_id', '=', request.params.uid)
-      .executeTakeFirst()
+    const member = await prisma.teamMember.findFirst({
+      where: {
+        team_id: request.params.id,
+        user_id: request.params.uid,
+      },
+      select: {
+        credit_used: true,
+        quota_period: true,
+      },
+    })
 
     if (!member) return reply.notFound('成员不存在')
 
@@ -712,30 +715,34 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    await db
-      .updateTable('team_members')
-      .set(updates)
-      .where('team_id', '=', request.params.id)
-      .where('user_id', '=', request.params.uid)
-      .execute()
+    await prisma.teamMember.update({
+      where: {
+        team_id_user_id: {
+          team_id: request.params.id,
+          user_id: request.params.uid,
+        },
+      },
+      data: updates,
+    })
 
     return { success: true, credit_used: 0 }
   })
 
   // DELETE /teams/:id/members/:uid — remove member
-  app.delete<{ Params: { id: string; uid: string } }>('/teams/:id/members/:uid', {
-    preHandler: teamRoleGuard('owner'),
-    config: { rateLimit: false },
-  }, async (request, reply) => {
-    const db = getDb()
-
+  app.delete<{ Params: { id: string; uid: string } }>(
+    '/teams/:id/members/:uid',
+    {
+      preHandler: teamRoleGuard('owner'),
+      config: { rateLimit: false },
+    }, async (request, reply) => {
     // Don't allow removing the owner
-    const member = await db
-      .selectFrom('team_members')
-      .select('role')
-      .where('team_id', '=', request.params.id)
-      .where('user_id', '=', request.params.uid)
-      .executeTakeFirst()
+    const member = await prisma.teamMember.findFirst({
+      where: {
+        team_id: request.params.id,
+        user_id: request.params.uid,
+      },
+      select: { role: true },
+    })
 
     if (!member) return reply.notFound('Member not found')
     if (member.role === 'owner') {
@@ -746,15 +753,15 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Check for in-flight generation tasks
-    const pendingBatches = await db
-      .selectFrom('task_batches')
-      .select(db.fn.count('id').as('count'))
-      .where('team_id', '=', request.params.id)
-      .where('user_id', '=', request.params.uid)
-      .where('status', 'in', ['pending', 'processing'])
-      .executeTakeFirstOrThrow()
+    const pendingBatches = await prisma.taskBatch.count({
+      where: {
+        team_id: request.params.id,
+        user_id: request.params.uid,
+        status: { in: ['pending', 'processing'] },
+      },
+    })
 
-    if (Number(pendingBatches.count) > 0) {
+    if (pendingBatches > 0) {
       return reply.status(409).send({
         success: false,
         error: {
@@ -765,47 +772,46 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Remove from all workspaces in this team
-    const workspaceIds = await db
-      .selectFrom('workspaces')
-      .select('id')
-      .where('team_id', '=', request.params.id)
-      .execute()
+    const workspaceIds = await prisma.workspace.findMany({
+      where: { team_id: request.params.id },
+      select: { id: true },
+    })
 
-    if (workspaceIds.length > 0) {
-      await db
-        .deleteFrom('workspace_members')
-        .where('user_id', '=', request.params.uid)
-        .where('workspace_id', 'in', workspaceIds.map(w => w.id))
-        .execute()
+    const workspaceIdList = workspaceIds.map((w) => w.id)
+    if (workspaceIdList.length > 0) {
+      await prisma.workspaceMember.deleteMany({
+        where: {
+          user_id: request.params.uid,
+          workspace_id: { in: workspaceIdList },
+        },
+      })
     }
 
-    await db
-      .deleteFrom('team_members')
-      .where('team_id', '=', request.params.id)
-      .where('user_id', '=', request.params.uid)
-      .execute()
+    await prisma.teamMember.delete({
+      where: {
+        team_id_user_id: {
+          team_id: request.params.id,
+          user_id: request.params.uid,
+        },
+      },
+    })
 
     // If user has no remaining teams, suspend the account
-    const remainingTeams = await db
-      .selectFrom('team_members')
-      .select(db.fn.count('team_id').as('count'))
-      .where('user_id', '=', request.params.uid)
-      .executeTakeFirstOrThrow()
+    const remainingTeams = await prisma.teamMember.count({
+      where: { user_id: request.params.uid },
+    })
 
-    if (Number(remainingTeams.count) === 0) {
-      await db
-        .updateTable('users')
-        .set({ status: 'suspended' })
-        .where('id', '=', request.params.uid)
-        .execute()
+    if (remainingTeams === 0) {
+      await prisma.user.update({
+        where: { id: request.params.uid },
+        data: { status: 'suspended' },
+      })
 
       // Revoke all refresh tokens so suspended user can't keep using the app
-      await db
-        .updateTable('refresh_tokens')
-        .set({ revoked_at: sql`NOW()` })
-        .where('user_id', '=', request.params.uid)
-        .where('revoked_at', 'is', null)
-        .execute()
+      await prisma.refreshToken.updateMany({
+        where: { user_id: request.params.uid, revoked_at: null },
+        data: { revoked_at: new Date() },
+      })
     }
 
     return { success: true }
@@ -836,7 +842,6 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
       return reply.badRequest('At least one of credit_quota or quota_period is required')
     }
 
-    const db = getDb()
     const updates: Record<string, unknown> = {}
     if (credit_quota !== undefined) updates.credit_quota = credit_quota
     if (quota_period !== undefined) {
@@ -851,13 +856,14 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    await db
-      .updateTable('team_members')
-      .set(updates)
-      .where('team_id', '=', request.params.id)
-      .where('user_id', 'in', user_ids)
-      .where('role', '!=', 'owner')
-      .execute()
+    await prisma.teamMember.updateMany({
+      where: {
+        team_id: request.params.id,
+        user_id: { in: user_ids },
+        role: { not: 'owner' },
+      },
+      data: updates,
+    })
 
     return { success: true, updated: user_ids.length }
   })
@@ -867,45 +873,53 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
     preHandler: teamRoleGuard('owner'),
     config: { rateLimit: false },
   }, async (request) => {
-    const db = getDb()
-    const workspaces = await db
-      .selectFrom('workspaces')
-      .select(['id', 'name', 'description', 'created_at'])
-      .where('team_id', '=', request.params.id)
-      .where('is_deleted', '=', false)
-      .orderBy('created_at', 'asc')
-      .execute()
+    const workspaces = await prisma.workspace.findMany({
+      where: {
+        team_id: request.params.id,
+        is_deleted: false,
+      },
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        created_at: true,
+      },
+      orderBy: { created_at: 'asc' },
+    })
 
-    const memberCounts = await db
-      .selectFrom('workspace_members')
-      .select(['workspace_id', db.fn.count('id').as('count')])
-      .where('workspace_id', 'in', workspaces.map(w => w.id))
-      .groupBy('workspace_id')
-      .execute()
+    const workspaceIds = workspaces.map((w) => w.id)
 
-    const countMap = Object.fromEntries(memberCounts.map(r => [r.workspace_id, Number(r.count)]))
-    return { data: workspaces.map(w => ({ ...w, member_count: countMap[w.id] ?? 0 })) }
+    // 获取每个 workspace 的成员数量
+    const memberCounts = await prisma.workspaceMember.groupBy({
+      by: ['workspace_id'],
+      _count: { id: true },
+      where: { workspace_id: { in: workspaceIds } },
+    })
+
+    const countMap = Object.fromEntries(memberCounts.map((r) => [r.workspace_id, r._count.id]))
+    return { data: workspaces.map((w) => ({ ...w, member_count: countMap[w.id] ?? 0 })) }
   })
 
   // GET /teams/:id/batches — all team generation records
   app.get<{ Params: { id: string }; Querystring: { cursor?: string; limit?: string } }>('/teams/:id/batches', {
     preHandler: teamRoleGuard('owner'),
   }, async (request) => {
-    const db = getDb()
     const limit = Math.min(parseInt(request.query.limit ?? '20', 10), 100)
 
-    let query = db
-      .selectFrom('task_batches')
-      .selectAll()
-      .where('team_id', '=', request.params.id)
-      .orderBy('created_at', 'desc')
-      .limit(limit + 1)
-
-    if (request.query.cursor) {
-      query = query.where('created_at', '<', request.query.cursor as any)
+    const where: any = {
+      team_id: request.params.id,
     }
 
-    const rows = await query.execute()
+    if (request.query.cursor) {
+      where.created_at = { lt: new Date(request.query.cursor) }
+    }
+
+    const rows = await prisma.taskBatch.findMany({
+      where,
+      orderBy: { created_at: 'desc' },
+      take: limit + 1,
+    })
+
     const hasMore = rows.length > limit
     const data = hasMore ? rows.slice(0, limit) : rows
 
@@ -926,11 +940,10 @@ export async function teamRoutes(app: FastifyInstance): Promise<void> {
       },
     },
   }, async (request) => {
-    const db = getDb()
-    await db.updateTable('teams')
-      .set({ allow_member_topup: request.body.allow })
-      .where('id', '=', request.params.id)
-      .execute()
+    await prisma.team.update({
+      where: { id: request.params.id },
+      data: { allow_member_topup: request.body.allow },
+    })
     return { success: true }
   })
 }

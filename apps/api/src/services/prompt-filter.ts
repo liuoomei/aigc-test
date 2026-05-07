@@ -1,4 +1,4 @@
-import { getDb } from '@aigc/db'
+import { prisma } from '../lib/prisma.js'
 
 interface FilterRule {
   id: string
@@ -22,16 +22,14 @@ async function loadRules(): Promise<FilterRule[]> {
   const now = Date.now()
   if (cachedRules && now < cacheExpiry) return cachedRules
 
-  const db = getDb()
-  const rows = await db
-    .selectFrom('prompt_filter_rules')
-    .select(['id', 'pattern', 'type', 'action', 'description'])
-    .where('is_active', '=', true)
-    .execute()
+  const rows = await prisma.promptFilterRule.findMany({
+    where: { is_active: true },
+    select: { id: true, pattern: true, type: true, action: true, description: true },
+  })
 
-  cachedRules = rows
+  cachedRules = rows as FilterRule[]
   cacheExpiry = now + CACHE_TTL
-  return rows
+  return cachedRules
 }
 
 export async function checkPrompt(
@@ -56,17 +54,14 @@ export async function checkPrompt(
     }
 
     if (matched && rule.action === 'reject') {
-      // Log rejection
-      const db = getDb()
-      await db
-        .insertInto('prompt_filter_logs')
-        .values({
+      await prisma.promptFilterLog.create({
+        data: {
           user_id: userId,
           prompt,
           matched_rules: JSON.stringify([{ id: rule.id, pattern: rule.pattern }]),
           action: 'rejected',
-        })
-        .execute()
+        },
+      })
 
       return {
         allowed: false,
@@ -76,17 +71,14 @@ export async function checkPrompt(
     }
   }
 
-  // Log pass
-  const db = getDb()
-  await db
-    .insertInto('prompt_filter_logs')
-    .values({
+  await prisma.promptFilterLog.create({
+    data: {
       user_id: userId,
       prompt,
       matched_rules: JSON.stringify([]),
       action: 'pass',
-    })
-    .execute()
+    },
+  })
 
   return { allowed: true }
 }

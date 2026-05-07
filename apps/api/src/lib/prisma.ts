@@ -5,7 +5,7 @@
  * 使用单例模式防止 HMR 时连接断开。
  */
 
-import { PrismaClient } from '@aigc/db'
+import { PrismaClient } from '@prisma/client'
 
 // 全局变量用于开发环境（防止 HMR 断开连接）
 const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined }

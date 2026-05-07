@@ -1,67 +1,83 @@
-import { getDb } from '@aigc/db'
+import { prisma } from '../lib/prisma.js'
 
-export async function buildUserProfile(db: ReturnType<typeof getDb>, userId: string) {
-  const user = await db
-    .selectFrom('users')
-    .select(['id', 'email', 'phone', 'username', 'avatar_url', 'role', 'password_change_required'])
-    .where('id', '=', userId)
-    .executeTakeFirstOrThrow()
+export async function buildUserProfile(db: typeof prisma, userId: string) {
+  const user = await db.user.findUniqueOrThrow({
+    where: { id: userId },
+    select: {
+      id: true,
+      email: true,
+      phone: true,
+      username: true,
+      avatar_url: true,
+      role: true,
+      password_change_required: true,
+    },
+  })
 
-  const teamRows = await db
-    .selectFrom('team_members')
-    .innerJoin('teams', 'teams.id', 'team_members.team_id')
-    .select(['teams.id as team_id', 'teams.name as team_name', 'teams.owner_id', 'teams.team_type', 'teams.allow_member_topup', 'team_members.role'])
-    .where('team_members.user_id', '=', userId)
-    .where('teams.is_deleted', '=', false)
-    .execute()
+  const teamRows = await db.teamMember.findMany({
+    where: {
+      user_id: userId,
+      team: { is_deleted: false },
+    },
+    select: {
+      role: true,
+      team: {
+        select: {
+          id: true,
+          name: true,
+          owner_id: true,
+          team_type: true,
+          allow_member_topup: true,
+        },
+      },
+    },
+  })
 
-  // Fetch owner info for each team
-  const ownerIds = [...new Set(teamRows.map((t) => t.owner_id).filter(Boolean))]
+  // 批量获取 owner 信息
+  const ownerIds = [...new Set(teamRows.map((t) => t.team.owner_id).filter(Boolean) as string[])]
   const ownerMap = new Map<string, { email: string | null; username: string }>()
   if (ownerIds.length > 0) {
-    const owners = await db
-      .selectFrom('users')
-      .select(['id', 'email', 'username'])
-      .where('id', 'in', ownerIds)
-      .execute()
+    const owners = await db.user.findMany({
+      where: { id: { in: ownerIds } },
+      select: { id: true, email: true, username: true },
+    })
     for (const o of owners) ownerMap.set(o.id, { email: o.email, username: o.username })
   }
 
-  // Fetch all workspace memberships in one query to avoid N+1
-  const teamIds = teamRows.map((t) => t.team_id)
-  let allWsRows: Array<{ ws_id: string; ws_name: string; role: string; team_id: string }> = []
-  if (teamIds.length > 0) {
-    allWsRows = await db
-      .selectFrom('workspace_members')
-      .innerJoin('workspaces', 'workspaces.id', 'workspace_members.workspace_id')
-      .select([
-        'workspaces.id as ws_id',
-        'workspaces.name as ws_name',
-        'workspace_members.role',
-        'workspaces.team_id',
-      ])
-      .where('workspace_members.user_id', '=', userId)
-      .where('workspaces.team_id', 'in', teamIds)
-      .where('workspaces.is_deleted', '=', false)
-      .execute()
-  }
+  // 批量获取 workspace 成员关系，避免 N+1
+  const teamIds = teamRows.map((t) => t.team.id)
+  const allWsRows = teamIds.length > 0
+    ? await db.workspaceMember.findMany({
+        where: {
+          user_id: userId,
+          workspace: { team_id: { in: teamIds }, is_deleted: false },
+        },
+        select: {
+          role: true,
+          workspace: {
+            select: { id: true, name: true, team_id: true },
+          },
+        },
+      })
+    : []
 
-  // Group workspaces by team_id
+  // 按 team_id 分组 workspace
   const wsByTeam = new Map<string, Array<{ id: string; name: string; role: string }>>()
   for (const w of allWsRows) {
-    const list = wsByTeam.get(w.team_id) ?? []
-    list.push({ id: w.ws_id, name: w.ws_name, role: w.role })
-    wsByTeam.set(w.team_id, list)
+    if (!w.workspace.team_id) continue
+    const list = wsByTeam.get(w.workspace.team_id) ?? []
+    list.push({ id: w.workspace.id, name: w.workspace.name, role: w.role })
+    wsByTeam.set(w.workspace.team_id, list)
   }
 
   const teams = teamRows.map((t) => ({
-    id: t.team_id,
-    name: t.team_name,
+    id: t.team.id,
+    name: t.team.name,
     role: t.role,
-    team_type: (t as any).team_type ?? 'standard',
-    allow_member_topup: (t as any).allow_member_topup ?? false,
-    owner: ownerMap.get(t.owner_id) ?? null,
-    workspaces: wsByTeam.get(t.team_id) ?? [],
+    team_type: t.team.team_type,
+    allow_member_topup: t.team.allow_member_topup,
+    owner: ownerMap.get(t.team.owner_id) ?? null,
+    workspaces: wsByTeam.get(t.team.id) ?? [],
   }))
 
   return {

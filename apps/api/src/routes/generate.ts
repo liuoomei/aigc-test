@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
-import { getDb } from '@aigc/db'
-import type { GenerateImageRequest, BatchResponse, TaskResponse } from '@aigc/types'
+import { prisma } from '../lib/prisma.js'
+import type { GenerateImageRequest } from '@aigc/types'
 import { checkPrompt } from '../services/prompt-filter.js'
 import { freezeCredits, refundCredits } from '../services/credit.js'
 import { getImageQueue } from '../lib/queue.js'
@@ -44,7 +44,8 @@ function sanitizeParams(raw: Record<string, unknown>): Record<string, unknown> {
   return sanitized
 }
 
-function logGenerateSubmissionError(
+/** 记录生成提交错误到数据库 */
+async function logGenerateSubmissionError(
   app: FastifyInstance,
   payload: {
     userId: string
@@ -54,16 +55,18 @@ function logGenerateSubmissionError(
     model?: string | null
     canvasId?: string | null
   },
-): void {
-  getDb().insertInto('submission_errors').values({
-    user_id: payload.userId,
-    source: 'generate_api',
-    error_code: payload.errorCode,
-    http_status: payload.httpStatus,
-    detail: payload.detail ? payload.detail.slice(0, 1000) : null,
-    model: payload.model ?? null,
-    canvas_id: payload.canvasId ?? null,
-  }).execute().catch((err) => {
+): Promise<void> {
+  prisma.submissionError.create({
+    data: {
+      user_id: payload.userId,
+      source: 'generate_api',
+      error_code: payload.errorCode,
+      http_status: payload.httpStatus,
+      detail: payload.detail ? payload.detail.slice(0, 1000) : null,
+      model: payload.model ?? null,
+      canvas_id: payload.canvasId ?? null,
+    },
+  }).catch((err) => {
     app.log.warn({ err, errorCode: payload.errorCode }, 'Failed to log submission error')
   })
 }
@@ -129,41 +132,41 @@ export async function generateRoutes(app: FastifyInstance): Promise<void> {
     // so the worker can use them for generation.
     const { image: _imageData, ...paramsForDb } = params as Record<string, unknown> & { image?: unknown }
 
-    const db = getDb()
-
     const userId = request.user.id
 
     // Check pending batch limit to prevent queue flooding
-    const pendingCount = await db
-      .selectFrom('task_batches')
-      .select(db.fn.count('id').as('count'))
-      .where('user_id', '=', userId)
-      .where('status', 'in', ['pending', 'processing'])
-      .executeTakeFirstOrThrow()
+    const pendingCount = await prisma.taskBatch.count({
+      where: {
+        user_id: userId,
+        status: { in: ['pending', 'processing'] },
+      },
+    })
 
-    if (Number(pendingCount.count) >= MAX_PENDING_BATCHES) {
+    if (pendingCount >= MAX_PENDING_BATCHES) {
       logGenerateSubmissionError(app, {
         userId,
         errorCode: 'TOO_MANY_PENDING',
         httpStatus: 429,
-        detail: `pending_count=${pendingCount.count}`,
+        detail: `pending_count=${pendingCount}`,
         model,
         canvasId: canvas_id,
       })
       return reply.status(429).send({
         success: false,
-        error: { code: 'TOO_MANY_PENDING', message: `您有 ${pendingCount.count} 个任务正在处理中，请等待完成后再提交新任务（上限 ${MAX_PENDING_BATCHES}）` },
+        error: { code: 'TOO_MANY_PENDING', message: `您有 ${pendingCount} 个任务正在处理中，请等待完成后再提交新任务（上限 ${MAX_PENDING_BATCHES}）` },
       })
     }
 
     // Verify user is a workspace member with at least 'editor' role
-    const wsMember = await db
-      .selectFrom('workspace_members')
-      .innerJoin('workspaces', 'workspaces.id', 'workspace_members.workspace_id')
-      .select(['workspaces.team_id', 'workspace_members.role'])
-      .where('workspace_members.workspace_id', '=', workspaceId)
-      .where('workspace_members.user_id', '=', userId)
-      .executeTakeFirst()
+    const wsMember = await prisma.workspaceMember.findFirst({
+      where: {
+        workspace_id: workspaceId,
+        user_id: userId,
+      },
+      include: {
+        workspace: { select: { team_id: true } },
+      },
+    })
 
     // Admin users bypass workspace membership check
     if (!wsMember && request.user.role !== 'admin') {
@@ -199,15 +202,14 @@ export async function generateRoutes(app: FastifyInstance): Promise<void> {
     // Look up team via workspace
     let teamId: string
     if (wsMember) {
-      teamId = wsMember.team_id
+      teamId = wsMember.workspace.team_id!
     } else {
       // Admin user — look up team directly
-      const workspace = await db
-        .selectFrom('workspaces')
-        .select('team_id')
-        .where('id', '=', workspaceId)
-        .executeTakeFirst()
-      if (!workspace) {
+      const workspace = await prisma.workspace.findUnique({
+        where: { id: workspaceId },
+        select: { team_id: true },
+      })
+      if (!workspace || !workspace.team_id) {
         logGenerateSubmissionError(app, {
           userId,
           errorCode: 'NOT_FOUND',
@@ -225,12 +227,13 @@ export async function generateRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Ensure user is a team member (required for credit tracking)
-    const teamMember = await db
-      .selectFrom('team_members')
-      .select(['user_id', 'priority_boost'])
-      .where('team_id', '=', teamId)
-      .where('user_id', '=', userId)
-      .executeTakeFirst()
+    const teamMember = await prisma.teamMember.findFirst({
+      where: {
+        team_id: teamId,
+        user_id: userId,
+      },
+      select: { user_id: true, priority_boost: true },
+    })
 
     if (!teamMember) {
       logGenerateSubmissionError(app, {
@@ -252,20 +255,18 @@ export async function generateRoutes(app: FastifyInstance): Promise<void> {
     const jobPriority = isHighPriority ? 1 : 10
 
     // Idempotency check
-    const existing = await db
-      .selectFrom('task_batches')
-      .selectAll()
-      .where('idempotency_key', '=', idempotency_key)
-      .where('user_id', '=', userId)
-      .executeTakeFirst()
+    const existing = await prisma.taskBatch.findFirst({
+      where: {
+        idempotency_key,
+        user_id: userId,
+      },
+    })
 
     if (existing) {
       // Return existing batch
-      const tasks = await db
-        .selectFrom('tasks')
-        .selectAll()
-        .where('batch_id', '=', existing.id)
-        .execute()
+      const tasks = await prisma.task.findMany({
+        where: { batch_id: existing.id },
+      })
 
       return reply.send({
         id: existing.id,
@@ -280,16 +281,16 @@ export async function generateRoutes(app: FastifyInstance): Promise<void> {
         status: existing.status,
         estimated_credits: existing.estimated_credits,
         actual_credits: existing.actual_credits,
-        created_at: existing.created_at.toISOString?.() ?? String(existing.created_at),
-        tasks: tasks.map((t: any) => ({
+        created_at: existing.created_at.toISOString(),
+        tasks: tasks.map((t) => ({
           id: t.id,
           version_index: t.version_index,
           status: t.status,
           estimated_credits: t.estimated_credits,
           credits_cost: t.credits_cost,
           error_message: t.error_message,
-          processing_started_at: t.processing_started_at?.toISOString?.() ?? t.processing_started_at ?? null,
-          completed_at: t.completed_at?.toISOString?.() ?? t.completed_at ?? null,
+          processing_started_at: t.processing_started_at?.toISOString() ?? null,
+          completed_at: t.completed_at?.toISOString() ?? null,
           asset: null,
         })),
       })
@@ -336,19 +337,16 @@ export async function generateRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // Lookup model
-    const providerModel = await db
-      .selectFrom('provider_models')
-      .innerJoin('providers', 'providers.id', 'provider_models.provider_id')
-      .select([
-        'provider_models.id as modelId',
-        'provider_models.credit_cost',
-        'providers.code as providerCode',
-        'providers.id as providerId',
-      ])
-      .where('provider_models.code', '=', model)
-      .where('provider_models.is_active', '=', true)
-      .where('providers.is_active', '=', true)
-      .executeTakeFirst()
+    const providerModel = await prisma.providerModel.findFirst({
+      where: {
+        code: model,
+        is_active: true,
+        provider: { is_active: true },
+      },
+      include: {
+        provider: { select: { code: true, id: true } },
+      },
+    })
 
     if (!providerModel) {
       logGenerateSubmissionError(app, {
@@ -392,28 +390,26 @@ export async function generateRoutes(app: FastifyInstance): Promise<void> {
     // If either step fails after freeze, refund to prevent orphan frozen credits
     let batch: { batch: any; tasks: any[] }
     try {
-      batch = await db.transaction().execute(async (trx: any) => {
-        const batchResult = await trx
-          .insertInto('task_batches')
-          .values({
+      const result = await prisma.$transaction(async (tx) => {
+        const batchResult = await tx.taskBatch.create({
+          data: {
             user_id: userId,
             team_id: teamId,
             workspace_id: workspaceId,
             credit_account_id: creditAccountId,
             idempotency_key,
             module: 'image',
-            provider: providerModel.providerCode,
+            provider: providerModel.provider.code,
             model,
             prompt,
-            params: JSON.stringify(paramsForDb),
+            params: paramsForDb as import("@prisma/client").Prisma.InputJsonValue,
             quantity,
             status: 'pending',
             estimated_credits: totalCost,
             ...(canvas_id ? { canvas_id, canvas_node_id: canvas_node_id ?? null } : {}),
             ...(video_studio_project_id ? { video_studio_project_id } : {}),
-          })
-          .returningAll()
-          .executeTakeFirstOrThrow()
+          },
+        })
 
         const taskValues = Array.from({ length: quantity }, (_, i) => ({
           batch_id: batchResult.id,
@@ -423,14 +419,17 @@ export async function generateRoutes(app: FastifyInstance): Promise<void> {
           status: 'pending' as const,
         }))
 
-        const tasks = await trx
-          .insertInto('tasks')
-          .values(taskValues)
-          .returningAll()
-          .execute()
+        const tasks = await tx.task.createMany({
+          data: taskValues,
+        })
 
-        return { batch: batchResult, tasks }
+        const createdTasks = await tx.task.findMany({
+          where: { batch_id: batchResult.id },
+        })
+
+        return { batch: batchResult, tasks: createdTasks }
       })
+      batch = result
 
       // Enqueue BullMQ jobs
       for (const task of batch.tasks) {
@@ -440,7 +439,7 @@ export async function generateRoutes(app: FastifyInstance): Promise<void> {
           userId,
           teamId,
           creditAccountId,
-          provider: providerModel.providerCode,
+          provider: providerModel.provider.code,
           model,
           prompt,
           params,
@@ -474,7 +473,7 @@ export async function generateRoutes(app: FastifyInstance): Promise<void> {
     return reply.status(201).send({
       id: batch.batch.id,
       module: 'image',
-      provider: providerModel.providerCode,
+      provider: providerModel.provider.code,
       model,
       prompt,
       params: paramsForDb,
@@ -484,8 +483,8 @@ export async function generateRoutes(app: FastifyInstance): Promise<void> {
       status: 'pending',
       estimated_credits: totalCost,
       actual_credits: 0,
-      created_at: batch.batch.created_at.toISOString?.() ?? String(batch.batch.created_at),
-      tasks: batch.tasks.map((t: any) => ({
+      created_at: batch.batch.created_at.toISOString(),
+      tasks: batch.tasks.map((t) => ({
         id: t.id,
         version_index: t.version_index,
         status: t.status,

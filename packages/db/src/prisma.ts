@@ -2,6 +2,9 @@
 // 供 API 和 Worker 项目使用
 import { PrismaClient } from '@prisma/client';
 
+// Re-export PrismaClient for consumers
+export { PrismaClient } from '@prisma/client';
+
 // PrismaClient 实例（单例模式）
 const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined }
 

@@ -1,13 +1,13 @@
 import type { FastifyInstance } from 'fastify'
-import { getDb } from '@aigc/db'
+import { prisma } from '../lib/prisma.js'
 import { signAssetUrl, extractStorageKey, signThumbnailUrl, verifyThumbnailSig, getS3ObjectBuffer, encryptProxyUrl } from '../lib/storage.js'
 
 export async function assetRoutes(app: FastifyInstance): Promise<void> {
-  // In-memory thumbnail cache: key = "storageKey:width", value = WebP Buffer
+  // 内存缩略图缓存：key = "storageKey:width"，value = WebP Buffer
   const thumbnailCache = new Map<string, { data: Buffer; createdAt: number }>()
   const THUMBNAIL_CACHE_MAX = 500
 
-  // GET /assets/thumbnail — serve resized WebP (no auth required, HMAC-signed URL)
+  // GET /assets/thumbnail — 提供缩放后的 WebP（无需认证，HMAC 签名 URL）
   app.get<{ Querystring: { key: string; w?: string; exp: string; sig: string } }>(
     '/assets/thumbnail',
     {
@@ -60,7 +60,7 @@ export async function assetRoutes(app: FastifyInstance): Promise<void> {
           .toBuffer()
         contentType = 'image/webp'
       } catch {
-        // Fallback: serve original bytes
+        // 降级：返回原始数据
         resultBuffer = rawBuffer
         contentType = 'image/jpeg'
       }
@@ -80,10 +80,10 @@ export async function assetRoutes(app: FastifyInstance): Promise<void> {
       return reply.send(resultBuffer)
     },
   )
+
   app.get<{ Querystring: { workspace_id?: string; type?: string; date?: string; cursor?: string; limit?: string } }>(
     '/assets',
     async (request, reply) => {
-      const db = getDb()
       const { workspace_id, type, date, cursor, limit: limitStr } = request.query
       const userId = request.user.id
 
@@ -91,14 +91,12 @@ export async function assetRoutes(app: FastifyInstance): Promise<void> {
         return reply.badRequest('workspace_id is required')
       }
 
-      // Verify workspace membership
+      // 验证工作空间成员身份
       if (request.user.role !== 'admin') {
-        const wsMember = await db
-          .selectFrom('workspace_members')
-          .select('role')
-          .where('workspace_id', '=', workspace_id)
-          .where('user_id', '=', userId)
-          .executeTakeFirst()
+        const wsMember = await prisma.workspaceMember.findFirst({
+          where: { workspace_id, user_id: userId },
+          select: { role: true },
+        })
         if (!wsMember) {
           return reply.status(403).send({
             success: false,
@@ -118,70 +116,71 @@ export async function assetRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
-      let query = db
-        .selectFrom('assets as a')
-        .innerJoin('task_batches as b', 'b.id', 'a.batch_id')
-        .select([
-          'a.id',
-          'a.type',
-          'a.storage_url',
-          'a.original_url',
-          'a.created_at',
-          'b.id as batch_id',
-          'b.prompt',
-          'b.model',
-        ])
-        .where('b.workspace_id', '=', workspace_id)
-        .where('b.canvas_id', 'is', null)
-        .where('b.video_studio_project_id', 'is', null)
-        .where('a.is_deleted', '=', false)
-        .where((eb: any) => eb.or([
-          eb('a.transfer_status', '=', 'completed'),
-          eb('a.original_url', 'is not', null),
-        ]))
-        .orderBy('a.created_at', 'desc')
-        .orderBy('a.id', 'desc')
-        .limit(limit + 1)
-
-      if (type) {
-        query = query.where('a.type', '=', type)
+      // 构建 Prisma 查询
+      const whereConditions: any = {
+        batch: {
+          workspace_id,
+          canvas_id: null,
+          video_studio_project_id: null,
+        },
+        is_deleted: false,
+        OR: [
+          { transfer_status: 'completed' as const },
+          { original_url: { not: null } },
+        ],
       }
 
-      // Filter by local date (YYYY-MM-DD) using UTC date of created_at
+      if (type) {
+        whereConditions.type = type
+      }
+
+      // 按本地日期过滤（YYYY-MM-DD），使用 UTC 创建时间
       if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
-        query = query
-          .where('a.created_at', '>=', new Date(`${date}T00:00:00.000Z`) as any)
-          .where('a.created_at', '<',  new Date(`${date}T24:00:00.000Z`) as any)
+        whereConditions.created_at = {
+          gte: new Date(`${date}T00:00:00.000Z`),
+          lt: new Date(`${date}T24:00:00.000Z`),
+        }
       }
 
       if (decodedCursor) {
-        query = query.where((eb: any) =>
-          eb.or([
-            eb('a.created_at', '<', decodedCursor!.created_at),
-            eb.and([
-              eb('a.created_at', '=', decodedCursor!.created_at),
-              eb('a.id', '<', decodedCursor!.id),
-            ]),
-          ]),
-        )
+        whereConditions.AND = [
+          {
+            OR: [
+              { created_at: { lt: new Date(decodedCursor.created_at) } },
+              {
+                created_at: new Date(decodedCursor.created_at),
+                id: { lt: decodedCursor.id },
+              },
+            ],
+          },
+        ]
       }
 
-      const rows = await query.execute()
+      const rows = await prisma.asset.findMany({
+        where: whereConditions,
+        include: {
+          batch: {
+            select: { id: true, prompt: true, model: true },
+          },
+        },
+        orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+        take: limit + 1,
+      })
 
       const hasMore = rows.length > limit
       const assets = hasMore ? rows.slice(0, limit) : rows
 
-      // Sign URLs and build thumbnail URLs
+      // 签名 URL 并构建缩略图 URL
       const signed = await Promise.all(
-        assets.map(async (a: any) => {
+        assets.map(async (a) => {
           const rawUrl: string | null = a.storage_url
           const storageKey = rawUrl ? extractStorageKey(rawUrl) : null
           let thumbnail_url: string | null = null
           if (storageKey) {
-            // Our MinIO/S3 — HMAC-signed thumbnail endpoint
+            // MinIO/S3 — HMAC 签名缩略图端点
             thumbnail_url = signThumbnailUrl(storageKey, 400) || null
           } else if (rawUrl?.startsWith('http://')) {
-            // Encrypt URL to hide storage server IP
+            // 加密 URL 以隐藏存储服务器 IP
             thumbnail_url = `/api/v1/assets/proxy?token=${encryptProxyUrl(rawUrl)}&w=400`
           }
           return {
@@ -190,8 +189,8 @@ export async function assetRoutes(app: FastifyInstance): Promise<void> {
             storage_url: rawUrl ? await signAssetUrl(rawUrl) : null,
             thumbnail_url,
             original_url: a.original_url ? await signAssetUrl(a.original_url) : null,
-            created_at: a.created_at.toISOString?.() ?? String(a.created_at),
-            batch: { id: a.batch_id, prompt: a.prompt, model: a.model },
+            created_at: a.created_at.toISOString(),
+            batch: { id: a.batch.id, prompt: a.batch.prompt, model: a.batch.model },
           }
         }),
       )
@@ -199,7 +198,7 @@ export async function assetRoutes(app: FastifyInstance): Promise<void> {
       const nextCursor = hasMore && assets.length > 0
         ? Buffer.from(
             JSON.stringify({
-              created_at: assets[assets.length - 1].created_at.toISOString?.() ?? String(assets[assets.length - 1].created_at),
+              created_at: assets[assets.length - 1].created_at.toISOString(),
               id: assets[assets.length - 1].id,
             }),
           ).toString('base64')
@@ -209,21 +208,19 @@ export async function assetRoutes(app: FastifyInstance): Promise<void> {
     },
   )
 
-  // DELETE /assets/:id — soft-delete an asset
+  // DELETE /assets/:id — 软删除资产
   app.delete<{ Params: { id: string } }>(
     '/assets/:id',
     async (request, reply) => {
-      const db = getDb()
       const { id } = request.params
       const userId = request.user.id
 
-      const asset = await db
-        .selectFrom('assets as a')
-        .innerJoin('task_batches as b', 'b.id', 'a.batch_id')
-        .select(['a.id', 'a.user_id', 'b.workspace_id'])
-        .where('a.id', '=', id)
-        .where('a.is_deleted', '=', false)
-        .executeTakeFirst()
+      const asset = await prisma.asset.findFirst({
+        where: { id, is_deleted: false },
+        include: {
+          batch: { select: { workspace_id: true } },
+        },
+      })
 
       if (!asset) {
         return reply.status(404).send({
@@ -232,16 +229,14 @@ export async function assetRoutes(app: FastifyInstance): Promise<void> {
         })
       }
 
-      // Authorization: must own the asset, be a workspace member, or be admin
+      // 权限校验：必须是资产所有者、工作空间成员或管理员
       const isOwner = asset.user_id != null && asset.user_id === userId
       if (!isOwner && request.user.role !== 'admin') {
-        if (asset.workspace_id) {
-          const wsMember = await db
-            .selectFrom('workspace_members')
-            .select('role')
-            .where('workspace_id', '=', asset.workspace_id)
-            .where('user_id', '=', userId)
-            .executeTakeFirst()
+        if (asset.batch.workspace_id) {
+          const wsMember = await prisma.workspaceMember.findFirst({
+            where: { workspace_id: asset.batch.workspace_id, user_id: userId },
+            select: { role: true },
+          })
           if (!wsMember) {
             return reply.status(403).send({
               success: false,
@@ -256,78 +251,74 @@ export async function assetRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
-      await db
-        .updateTable('assets')
-        .set({ is_deleted: true, deleted_at: new Date() })
-        .where('id', '=', id)
-        .execute()
+      await prisma.asset.update({
+        where: { id },
+        data: { is_deleted: true, deleted_at: new Date() },
+      })
 
       return reply.status(204).send()
     },
   )
 
-  // GET /assets/trash — list soft-deleted assets for a workspace (within 7 days)
+  // GET /assets/trash — 列出工作空间的软删除资产（7 天内）
   app.get<{ Querystring: { workspace_id?: string } }>(
     '/assets/trash',
     async (request, reply) => {
-      const db = getDb()
       const { workspace_id } = request.query
       const userId = request.user.id
 
       if (!workspace_id) return reply.badRequest('workspace_id is required')
 
       if (request.user.role !== 'admin') {
-        const wsMember = await db
-          .selectFrom('workspace_members')
-          .select('role')
-          .where('workspace_id', '=', workspace_id)
-          .where('user_id', '=', userId)
-          .executeTakeFirst()
+        const wsMember = await prisma.workspaceMember.findFirst({
+          where: { workspace_id, user_id: userId },
+          select: { role: true },
+        })
         if (!wsMember) return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'Not a member of this workspace' } })
       }
 
       const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
 
-      const assets = await db
-        .selectFrom('assets as a')
-        .innerJoin('task_batches as b', 'b.id', 'a.batch_id')
-        .select(['a.id', 'a.type', 'a.storage_url', 'a.original_url', 'a.deleted_at', 'b.prompt'])
-        .where('b.workspace_id', '=', workspace_id)
-        .where('a.is_deleted', '=', true)
-        .where('a.deleted_at', '>=', cutoff as any)
-        .orderBy('a.deleted_at', 'desc')
-        .execute()
+      const assets = await prisma.asset.findMany({
+        where: {
+          batch: { workspace_id },
+          is_deleted: true,
+          deleted_at: { gte: cutoff },
+        },
+        include: {
+          batch: { select: { prompt: true } },
+        },
+        orderBy: { deleted_at: 'desc' },
+      })
 
       const signed = await Promise.all(
-        assets.map(async (a: any) => ({
+        assets.map(async (a) => ({
           id: a.id,
           type: a.type,
           storage_url: a.storage_url ? await signAssetUrl(a.storage_url) : null,
           original_url: a.original_url ?? null,
           deleted_at: a.deleted_at,
-          prompt: a.prompt,
-        }))
+          prompt: a.batch.prompt,
+        })),
       )
 
       return { data: signed }
-    }
+    },
   )
 
-  // POST /assets/trash/:id/restore — restore a soft-deleted asset
+  // POST /assets/trash/:id/restore — 恢复软删除的资产
   app.post<{ Params: { id: string } }>(
     '/assets/trash/:id/restore',
     async (request, reply) => {
-      const db = getDb()
       const { id } = request.params
       const userId = request.user.id
 
-      const asset = await db
-        .selectFrom('assets as a')
-        .innerJoin('task_batches as b', 'b.id', 'a.batch_id')
-        .select(['a.id', 'a.user_id', 'b.workspace_id'])
-        .where('a.id', '=', id)
-        .where('a.is_deleted', '=', true)
-        .executeTakeFirst()
+      const asset = await prisma.asset.findFirst({
+        where: { id, is_deleted: true },
+        include: {
+          batch: { select: { workspace_id: true } },
+        },
+      })
 
       if (!asset) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '资产不存在' } })
 
@@ -335,30 +326,26 @@ export async function assetRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'Not authorized' } })
       }
 
-      await db
-        .updateTable('assets')
-        .set({ is_deleted: false, deleted_at: null })
-        .where('id', '=', id)
-        .execute()
+      await prisma.asset.update({
+        where: { id },
+        data: { is_deleted: false, deleted_at: null },
+      })
 
       return { success: true }
-    }
+    },
   )
 
-  // DELETE /assets/trash/:id — permanently delete an asset
+  // DELETE /assets/trash/:id — 永久删除资产
   app.delete<{ Params: { id: string } }>(
     '/assets/trash/:id',
     async (request, reply) => {
-      const db = getDb()
       const { id } = request.params
       const userId = request.user.id
 
-      const asset = await db
-        .selectFrom('assets')
-        .select(['id', 'user_id'])
-        .where('id', '=', id)
-        .where('is_deleted', '=', true)
-        .executeTakeFirst()
+      const asset = await prisma.asset.findFirst({
+        where: { id, is_deleted: true },
+        select: { id: true, user_id: true },
+      })
 
       if (!asset) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '资产不存在' } })
 
@@ -366,9 +353,9 @@ export async function assetRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'Not authorized' } })
       }
 
-      await db.deleteFrom('assets').where('id', '=', id).execute()
+      await prisma.asset.delete({ where: { id } })
 
       return reply.status(204).send()
-    }
+    },
   )
 }

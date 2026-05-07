@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { pipeline } from 'node:stream/promises'
 import rateLimit from '@fastify/rate-limit'
-import { getDb } from '@aigc/db'
+import { prisma } from '../lib/prisma.js'
 
 const UPLOAD_DIR = '/tmp/ai-uploads'
 const MAX_VIDEO_AGE_MS = 15 * 60 * 1000 // 15 minutes
@@ -211,11 +211,13 @@ export async function aiAssistantRoutes(app: FastifyInstance): Promise<void> {
       if (!geminiRes.ok) {
         const errText = await geminiRes.text()
         app.log.error({ status: geminiRes.status, body: errText }, 'Gemini API error')
-        getDb().insertInto('ai_assistant_errors').values({
-          user_id: request.user.id,
-          http_status: geminiRes.status,
-          error_detail: errText.slice(0, 2000),
-        }).execute().catch(() => {})
+        prisma.aiAssistantError.create({
+          data: {
+            user_id: request.user.id,
+            http_status: geminiRes.status,
+            error_detail: errText.slice(0, 2000),
+          },
+        }).catch(() => {})
         return reply.status(502).send({
           success: false,
           error: { code: 'AI_ERROR', message: 'AI助手暂时不可用，请稍后重试' },

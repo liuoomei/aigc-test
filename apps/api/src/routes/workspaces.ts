@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify'
-import { getDb } from '@aigc/db'
+import { prisma } from '../lib/prisma.js'
 import { teamRoleGuard, workspaceGuard, workspaceTeamOwnerGuard } from '../plugins/guards.js'
 import type { CreateWorkspaceRequest } from '@aigc/types'
 
@@ -22,16 +22,15 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
   }, async (request, reply) => {
     const { name, description } = request.body
 
-    const db = getDb()
-
     // Check duplicate workspace name within team
-    const existing = await db
-      .selectFrom('workspaces')
-      .select('id')
-      .where('team_id', '=', request.params.id)
-      .where('name', '=', name)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const existing = await prisma.workspace.findFirst({
+      select: { id: true },
+      where: {
+        team_id: request.params.id,
+        name,
+        is_deleted: false,
+      },
+    })
     if (existing) {
       return reply.status(409).send({
         success: false,
@@ -39,26 +38,31 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
       })
     }
 
-    const workspace = await db
-      .insertInto('workspaces')
-      .values({
+    const workspace = await prisma.workspace.create({
+      data: {
         team_id: request.params.id,
         name,
         description: description ?? null,
         created_by: request.user.id,
-      })
-      .returning(['id', 'name', 'description', 'team_id', 'created_by', 'created_at'])
-      .executeTakeFirstOrThrow()
+      },
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        team_id: true,
+        created_by: true,
+        created_at: true,
+      },
+    })
 
     // Add creator as workspace admin
-    await db
-      .insertInto('workspace_members')
-      .values({
+    await prisma.workspaceMember.create({
+      data: {
         workspace_id: workspace.id,
         user_id: request.user.id,
         role: 'admin',
-      })
-      .execute()
+      },
+    })
 
     return reply.status(201).send(workspace)
   })
@@ -67,38 +71,46 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: { id: string } }>('/workspaces/:id', {
     preHandler: workspaceGuard('viewer'),
   }, async (request) => {
-    const db = getDb()
-    const workspace = await db
-      .selectFrom('workspaces')
-      .selectAll()
-      .where('id', '=', request.params.id)
-      .executeTakeFirstOrThrow()
+    const workspace = await prisma.workspace.findUniqueOrThrow({
+      where: { id: request.params.id },
+    })
 
-    const memberCount = await db
-      .selectFrom('workspace_members')
-      .select(db.fn.count('id').as('count'))
-      .where('workspace_id', '=', request.params.id)
-      .executeTakeFirstOrThrow()
+    const memberCount = await prisma.workspaceMember.count({
+      where: { workspace_id: request.params.id },
+    })
 
-    return { ...workspace, member_count: Number(memberCount.count) }
+    return { ...workspace, member_count: memberCount }
   })
 
   // GET /workspaces/:id/members — list workspace members
   app.get<{ Params: { id: string } }>('/workspaces/:id/members', {
     preHandler: workspaceTeamOwnerGuard(),
   }, async (request) => {
-    const db = getDb()
-    const members = await db
-      .selectFrom('workspace_members')
-      .innerJoin('users', 'users.id', 'workspace_members.user_id')
-      .select([
-        'users.id as user_id', 'users.account', 'users.username', 'users.avatar_url',
-        'workspace_members.role', 'workspace_members.created_at',
-      ])
-      .where('workspace_members.workspace_id', '=', request.params.id)
-      .execute()
+    const members = await prisma.workspaceMember.findMany({
+      where: { workspace_id: request.params.id },
+      include: {
+        user: {
+          select: {
+            id: true,
+            account: true,
+            username: true,
+            avatar_url: true,
+          },
+        },
+      },
+    })
 
-    return { data: members }
+    // 转换格式以匹配原有返回结构
+    const data = members.map((m) => ({
+      user_id: m.user.id,
+      account: m.user.account,
+      username: m.user.username,
+      avatar_url: m.user.avatar_url,
+      role: m.role,
+      created_at: m.created_at,
+    }))
+
+    return { data }
   })
 
   // POST /workspaces/:id/members — add member to workspace
@@ -118,24 +130,22 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
   }, async (request, reply) => {
     const { user_id, role } = request.body
 
-    const db = getDb()
-
     // Verify the workspace exists and get its team_id
-    const workspace = await db
-      .selectFrom('workspaces')
-      .select('team_id')
-      .where('id', '=', request.params.id)
-      .executeTakeFirst()
+    const workspace = await prisma.workspace.findUnique({
+      select: { team_id: true },
+      where: { id: request.params.id },
+    })
 
     if (!workspace) return reply.notFound('Workspace not found')
 
     // Verify user is a team member
-    const teamMember = await db
-      .selectFrom('team_members')
-      .select(['user_id', 'role'])
-      .where('team_id', '=', workspace.team_id)
-      .where('user_id', '=', user_id)
-      .executeTakeFirst()
+    const teamMember = await prisma.teamMember.findFirst({
+      select: { user_id: true, role: true },
+      where: {
+        team_id: workspace.team_id ?? undefined,
+        user_id,
+      },
+    })
 
     if (!teamMember) {
       return reply.status(400).send({
@@ -154,12 +164,13 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
     const effectiveRole = WS_RANK_TO_ROLE[Math.min(requestedRank, maxRank)]
 
     // Check if already a workspace member
-    const existing = await db
-      .selectFrom('workspace_members')
-      .select('id')
-      .where('workspace_id', '=', request.params.id)
-      .where('user_id', '=', user_id)
-      .executeTakeFirst()
+    const existing = await prisma.workspaceMember.findFirst({
+      select: { id: true },
+      where: {
+        workspace_id: request.params.id,
+        user_id,
+      },
+    })
 
     if (existing) {
       return reply.status(409).send({
@@ -168,14 +179,13 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
       })
     }
 
-    await db
-      .insertInto('workspace_members')
-      .values({
+    await prisma.workspaceMember.create({
+      data: {
         workspace_id: request.params.id,
         user_id,
         role: effectiveRole,
-      })
-      .execute()
+      },
+    })
 
     return reply.status(201).send({ success: true })
   })
@@ -184,12 +194,12 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
   app.delete<{ Params: { id: string; uid: string } }>('/workspaces/:id/members/:uid', {
     preHandler: workspaceTeamOwnerGuard(),
   }, async (request) => {
-    const db = getDb()
-    await db
-      .deleteFrom('workspace_members')
-      .where('workspace_id', '=', request.params.id)
-      .where('user_id', '=', request.params.uid)
-      .execute()
+    await prisma.workspaceMember.deleteMany({
+      where: {
+        workspace_id: request.params.id,
+        user_id: request.params.uid,
+      },
+    })
 
     return { success: true }
   })
@@ -198,34 +208,40 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
   app.delete<{ Params: { id: string; wsId: string } }>('/teams/:id/workspaces/:wsId', {
     preHandler: teamRoleGuard('owner'),
   }, async (request, reply) => {
-    const db = getDb()
     const { id: teamId, wsId } = request.params
 
-    const workspace = await db
-      .selectFrom('workspaces')
-      .select(['id', 'name'])
-      .where('id', '=', wsId)
-      .where('team_id', '=', teamId)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const workspace = await prisma.workspace.findFirst({
+      select: { id: true, name: true },
+      where: {
+        id: wsId,
+        team_id: teamId,
+        is_deleted: false,
+      },
+    })
     if (!workspace) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '工作区不存在' } })
 
     const now = new Date()
 
     // Cascade: soft-delete task_batches
-    await db
-      .updateTable('task_batches')
-      .set({ is_deleted: true, deleted_at: now })
-      .where('workspace_id', '=', wsId)
-      .where('is_deleted', '=', false)
-      .execute()
+    await prisma.taskBatch.updateMany({
+      where: {
+        workspace_id: wsId,
+        is_deleted: false,
+      },
+      data: {
+        is_deleted: true,
+        deleted_at: now,
+      },
+    })
 
     // Soft-delete workspace
-    await db
-      .updateTable('workspaces')
-      .set({ is_deleted: true, deleted_at: now })
-      .where('id', '=', wsId)
-      .execute()
+    await prisma.workspace.updateMany({
+      where: { id: wsId },
+      data: {
+        is_deleted: true,
+        deleted_at: now,
+      },
+    })
 
     return { success: true }
   })
@@ -234,17 +250,21 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: { id: string } }>('/teams/:id/trash', {
     preHandler: teamRoleGuard('owner'),
   }, async (request) => {
-    const db = getDb()
     const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
 
-    const workspaces = await db
-      .selectFrom('workspaces')
-      .select(['id', 'name', 'deleted_at'])
-      .where('team_id', '=', request.params.id)
-      .where('is_deleted', '=', true)
-      .where('deleted_at', '>=', cutoff as any)
-      .orderBy('deleted_at', 'desc')
-      .execute()
+    const workspaces = await prisma.workspace.findMany({
+      select: {
+        id: true,
+        name: true,
+        deleted_at: true,
+      },
+      where: {
+        team_id: request.params.id,
+        is_deleted: true,
+        deleted_at: { gte: cutoff },
+      },
+      orderBy: { deleted_at: 'desc' },
+    })
 
     return { data: workspaces }
   })
@@ -253,26 +273,27 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { id: string; wsId: string } }>('/teams/:id/trash/:wsId/restore', {
     preHandler: teamRoleGuard('owner'),
   }, async (request, reply) => {
-    const db = getDb()
     const { id: teamId, wsId } = request.params
 
-    const workspace = await db
-      .selectFrom('workspaces')
-      .select(['id', 'name'])
-      .where('id', '=', wsId)
-      .where('team_id', '=', teamId)
-      .where('is_deleted', '=', true)
-      .executeTakeFirst()
+    const workspace = await prisma.workspace.findFirst({
+      select: { id: true, name: true },
+      where: {
+        id: wsId,
+        team_id: teamId,
+        is_deleted: true,
+      },
+    })
     if (!workspace) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '已删除的工作区不存在或已过期' } })
 
     // Check name uniqueness before restoring
-    const nameConflict = await db
-      .selectFrom('workspaces')
-      .select('id')
-      .where('team_id', '=', teamId)
-      .where('name', '=', workspace.name)
-      .where('is_deleted', '=', false)
-      .executeTakeFirst()
+    const nameConflict = await prisma.workspace.findFirst({
+      select: { id: true },
+      where: {
+        team_id: teamId,
+        name: workspace.name,
+        is_deleted: false,
+      },
+    })
     if (nameConflict) {
       return reply.status(409).send({
         success: false,
@@ -280,19 +301,25 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
       })
     }
 
-    await db
-      .updateTable('workspaces')
-      .set({ is_deleted: false, deleted_at: null })
-      .where('id', '=', wsId)
-      .execute()
+    await prisma.workspace.updateMany({
+      where: { id: wsId },
+      data: {
+        is_deleted: false,
+        deleted_at: null,
+      },
+    })
 
     // Restore task_batches
-    await db
-      .updateTable('task_batches')
-      .set({ is_deleted: false, deleted_at: null })
-      .where('workspace_id', '=', wsId)
-      .where('is_deleted', '=', true)
-      .execute()
+    await prisma.taskBatch.updateMany({
+      where: {
+        workspace_id: wsId,
+        is_deleted: true,
+      },
+      data: {
+        is_deleted: false,
+        deleted_at: null,
+      },
+    })
 
     return { success: true }
   })
@@ -301,29 +328,33 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
   app.delete<{ Params: { id: string; wsId: string } }>('/teams/:id/trash/:wsId', {
     preHandler: teamRoleGuard('owner'),
   }, async (request, reply) => {
-    const db = getDb()
     const { id: teamId, wsId } = request.params
 
-    const workspace = await db
-      .selectFrom('workspaces')
-      .select('id')
-      .where('id', '=', wsId)
-      .where('team_id', '=', teamId)
-      .where('is_deleted', '=', true)
-      .executeTakeFirst()
+    const workspace = await prisma.workspace.findFirst({
+      select: { id: true },
+      where: {
+        id: wsId,
+        team_id: teamId,
+        is_deleted: true,
+      },
+    })
     if (!workspace) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '工作区不存在或未被删除' } })
 
     // Get batch IDs
-    const batchIds = (await db.selectFrom('task_batches').select('id').where('workspace_id', '=', wsId).execute()).map(b => b.id)
+    const batches = await prisma.taskBatch.findMany({
+      where: { workspace_id: wsId },
+      select: { id: true },
+    })
+    const batchIds = batches.map((b) => b.id)
 
     if (batchIds.length > 0) {
-      await db.deleteFrom('assets').where('batch_id', 'in', batchIds).execute()
-      await db.deleteFrom('tasks').where('batch_id', 'in', batchIds).execute()
-      await db.deleteFrom('task_batches').where('id', 'in', batchIds).execute()
+      await prisma.asset.deleteMany({ where: { batch_id: { in: batchIds } } })
+      await prisma.task.deleteMany({ where: { batch_id: { in: batchIds } } })
+      await prisma.taskBatch.deleteMany({ where: { id: { in: batchIds } } })
     }
 
-    await db.deleteFrom('workspace_members').where('workspace_id', '=', wsId).execute()
-    await db.deleteFrom('workspaces').where('id', '=', wsId).execute()
+    await prisma.workspaceMember.deleteMany({ where: { workspace_id: wsId } })
+    await prisma.workspace.deleteMany({ where: { id: wsId } })
 
     return { success: true }
   })
@@ -332,21 +363,22 @@ export async function workspaceRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Params: { id: string }; Querystring: { cursor?: string; limit?: string } }>('/workspaces/:id/batches', {
     preHandler: workspaceGuard('editor'),
   }, async (request) => {
-    const db = getDb()
     const limit = Math.min(parseInt(request.query.limit ?? '20', 10), 100)
 
-    let query = db
-      .selectFrom('task_batches')
-      .selectAll()
-      .where('workspace_id', '=', request.params.id)
-      .orderBy('created_at', 'desc')
-      .limit(limit + 1)
-
-    if (request.query.cursor) {
-      query = query.where('created_at', '<', request.query.cursor as any)
+    const where: { workspace_id: string; created_at?: { lt: Date } } = {
+      workspace_id: request.params.id,
     }
 
-    const rows = await query.execute()
+    if (request.query.cursor) {
+      where.created_at = { lt: new Date(request.query.cursor) }
+    }
+
+    const rows = await prisma.taskBatch.findMany({
+      where,
+      orderBy: { created_at: 'desc' },
+      take: limit + 1,
+    })
+
     const hasMore = rows.length > limit
     const data = hasMore ? rows.slice(0, limit) : rows
 

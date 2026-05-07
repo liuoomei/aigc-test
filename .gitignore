@@ -1,65 +1,34 @@
-node_modules/
-dist/
-.next/
-.turbo/
-*.env
-/prompts.env
-!.env.example
-!.env.*.example
-.worktrees/
+# This file is automatically added by @npmcli/template-oss. Do not edit.
 
-# Local Claude/session state
-.claude/settings.local.json
-.claude/worktrees/
+# ignore everything in the root
+/*
 
-# Build artifacts and caches
-*.tsbuildinfo
-apps/docs/out/
-logs/
-.pnpm-build-approvals.json
-
-# Editor/notebook checkpoints
-.ipynb_checkpoints/
-**/.ipynb_checkpoints/
-
-# Design/planning docs should stay out of the repo
-docs/plans/
-docs/ai-platform-pricing-plan.md
-canvas-*-plan.md
-*-design-plan.md
-*-redesign-plan.md
-
-# Internal reports and operations docs
-AI_*_ISSUE.md
-AI_*_REPORT.md
-API_*_DOCUMENTATION.md
-API_*_REPORT.md
-CREDIT_*_GUIDE.md
-DATABASE_*_GUIDE.md
-MIGRATION_*_EXPLAINED.md
-TIMEOUT_*_REPORT.md
-DEPLOY-TEST.md
-
-# Local operations scripts
-/deploy*.sh
-!/deploy.example.sh
-/setup.sh
-/start-*.sh
-!/start-api.example.sh
-!/start-web.example.sh
-!/start-worker.example.sh
-/patch_*.sh
-/update_db.js
-/update_db.ts
-
-# Generated test output
-apps/web/playwright-report/
-apps/web/test-results/
-
-# Stale tsc artifacts in non-src dirs (migrations/scripts run via tsx)
-packages/db/migrations/*.js
-packages/db/migrations/*.d.ts
-packages/db/migrations/*.map
-packages/db/scripts/*.js
-packages/db/scripts/*.d.ts
-packages/db/scripts/*.map
+!**/.gitignore
+!/.commitlintrc.js
+!/.eslint.config.js
+!/.eslintrc.js
+!/.eslintrc.local.*
+!/.git-blame-ignore-revs
+!/.github/
+!/.gitignore
+!/.npmrc
+!/.prettierignore
+!/.prettierrc.js
+!/.release-please-manifest.json
+!/bin/
+!/CHANGELOG*
+!/CODE_OF_CONDUCT.md
+!/CONTRIBUTING.md
+!/docs/
+!/lib/
+!/LICENSE*
+!/map.js
+!/package.json
+!/README*
+!/release-please-config.json
+!/scripts/
+!/SECURITY.md
+!/tap-snapshots/
+!/test/
+!/tsconfig.json
+tap-testdir*/

@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
-import { getDb } from '@aigc/db'
-import { sql } from 'kysely'
+import type { Prisma, AssetType } from '@prisma/client'
+import { prisma } from '../lib/prisma.js'
 import { signAssetUrl } from '../lib/storage.js'
 import { purgeVideoStudioProject, restoreProjectAssets, softDeleteProjectAssets } from '../lib/project-purge.js'
 
@@ -47,20 +47,16 @@ export async function videoStudioRoutes(app: FastifyInstance) {
   }
 
   async function assertProjectAccess(projectId: string, userId: string, requireDelete = false) {
-    const db = getDb()
-    const project = await db
-      .selectFrom('video_studio_projects')
-      .select(['workspace_id', 'user_id'])
-      .where('id', '=', projectId)
-      .executeTakeFirst()
+    const project = await prisma.videoStudioProject.findFirst({
+      where: { id: projectId },
+      select: { workspace_id: true, user_id: true },
+    })
     if (!project) return null
 
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', project.workspace_id)
-      .where('user_id', '=', userId)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id: project.workspace_id, user_id: userId },
+      select: { role: true },
+    })
     if (!member) return null
     if (requireDelete && project.user_id !== userId && member.role !== 'admin') return null
     return { project, member }
@@ -271,36 +267,27 @@ export async function videoStudioRoutes(app: FastifyInstance) {
   app.get<{ Querystring: { workspace_id: string } }>(
     '/video-studio/projects',
     async (request, reply) => {
-      const db = getDb()
       const userId = request.user.id
       const { workspace_id } = request.query
       if (!workspace_id) return reply.status(400).send({ error: 'workspace_id required' })
 
-      const member = await db
-        .selectFrom('workspace_members')
-        .select('workspace_id')
-        .where('workspace_id', '=', workspace_id)
-        .where('user_id', '=', userId)
-        .executeTakeFirst()
+      const member = await prisma.workspaceMember.findFirst({
+        where: { workspace_id, user_id: userId },
+        select: { role: true },
+      })
       if (!member) return reply.status(403).send({ error: 'forbidden' })
 
-      const projects = await db
-        .selectFrom('video_studio_projects')
-        .select(['id', 'name', 'created_at', 'updated_at', 'project_type', 'series_parent_id', 'episode_index'])
-        .where('workspace_id', '=', workspace_id)
-        .where('is_deleted', '=', false)
-        .where('series_parent_id', 'is', null)
-        .where((eb) => eb.or([
-          eb('user_id', '=', userId),
-          eb.exists(db
-            .selectFrom('workspace_members')
-            .select('workspace_id')
-            .where('workspace_id', '=', workspace_id)
-            .where('user_id', '=', userId)
-            .where('role', '=', 'admin')),
-        ]))
-        .orderBy('updated_at', 'desc')
-        .execute()
+      // 管理员可见所有项目，普通成员只能看自己的
+      const projects = await prisma.videoStudioProject.findMany({
+        where: {
+          workspace_id,
+          is_deleted: false,
+          series_parent_id: null,
+          ...(member.role === 'admin' ? {} : { user_id: userId }),
+        },
+        select: { id: true, name: true, created_at: true, updated_at: true },
+        orderBy: { updated_at: 'desc' },
+      })
 
       return reply.send(projects)
     },
@@ -310,24 +297,18 @@ export async function videoStudioRoutes(app: FastifyInstance) {
   app.get<{ Params: { id: string } }>(
     '/video-studio/projects/:id',
     async (request, reply) => {
-      const db = getDb()
       const userId = request.user.id
       const { id } = request.params
 
-      const project = await db
-        .selectFrom('video_studio_projects')
-        .selectAll()
-        .where('id', '=', id)
-        .where('is_deleted', '=', false)
-        .executeTakeFirst()
+      const project = await prisma.videoStudioProject.findFirst({
+        where: { id, is_deleted: false },
+      })
 
       if (!project) return reply.status(404).send({ error: 'not found' })
-      const member = await db
-        .selectFrom('workspace_members')
-        .select('workspace_id')
-        .where('workspace_id', '=', project.workspace_id)
-        .where('user_id', '=', userId)
-        .executeTakeFirst()
+      const member = await prisma.workspaceMember.findFirst({
+        where: { workspace_id: project.workspace_id, user_id: userId },
+        select: { workspace_id: true },
+      })
       if (!member) return reply.status(403).send({ error: 'forbidden' })
 
       const wizardState = project.wizard_state as Record<string, unknown> | null
@@ -400,24 +381,20 @@ export async function videoStudioRoutes(app: FastifyInstance) {
       },
     },
     async (request, reply) => {
-      const db = getDb()
       const userId = request.user.id
       const { id } = request.params
       const { workspace_id, name, wizard_state, project_type = 'single', series_parent_id = null, episode_index = null } = request.body
 
-      const member = await db
-        .selectFrom('workspace_members')
-        .select('workspace_id')
-        .where('workspace_id', '=', workspace_id)
-        .where('user_id', '=', userId)
-        .executeTakeFirst()
+      const member = await prisma.workspaceMember.findFirst({
+        where: { workspace_id, user_id: userId },
+        select: { workspace_id: true },
+      })
       if (!member) return reply.status(403).send({ error: 'forbidden' })
 
-      const existing = await db
-        .selectFrom('video_studio_projects')
-        .select(['workspace_id', 'is_deleted'])
-        .where('id', '=', id)
-        .executeTakeFirst()
+      const existing = await prisma.videoStudioProject.findFirst({
+        where: { id },
+        select: { workspace_id: true, is_deleted: true },
+      })
       if (existing?.is_deleted) return reply.status(404).send({ error: 'not found' })
       if (existing) {
         const access = await assertProjectAccess(id, userId, true)
@@ -426,41 +403,36 @@ export async function videoStudioRoutes(app: FastifyInstance) {
       }
 
       if (series_parent_id) {
-        const parent = await db
-          .selectFrom('video_studio_projects')
-          .select('workspace_id')
-          .where('id', '=', series_parent_id)
-          .where('workspace_id', '=', workspace_id)
-          .where('is_deleted', '=', false)
-          .executeTakeFirst()
+        const parent = await prisma.videoStudioProject.findFirst({
+          where: { id: series_parent_id, workspace_id, is_deleted: false },
+          select: { workspace_id: true },
+        })
         if (!parent) return reply.status(400).send({ error: 'series parent not found' })
         const parentAccess = await assertProjectAccess(series_parent_id, userId, true)
         if (!parentAccess) return reply.status(404).send({ error: 'not found' })
       }
 
-      await db
-        .insertInto('video_studio_projects')
-        .values({
+      await prisma.videoStudioProject.upsert({
+        where: { id },
+        create: {
           id,
           workspace_id,
           user_id: userId,
           name,
-          wizard_state: JSON.stringify(wizard_state),
+          wizard_state: wizard_state as Prisma.InputJsonValue,
           project_type,
           series_parent_id,
           episode_index,
-        })
-        .onConflict((oc) =>
-          oc.column('id').doUpdateSet({
-            name,
-            wizard_state: JSON.stringify(wizard_state) as any,
-            project_type,
-            series_parent_id,
-            episode_index,
-            updated_at: sql`now()`,
-          }),
-        )
-        .execute()
+        },
+        update: {
+          name,
+          wizard_state: wizard_state as Prisma.InputJsonValue,
+          project_type,
+          series_parent_id,
+          episode_index,
+          updated_at: new Date(),
+        },
+      })
 
       return reply.send({ success: true })
     },
@@ -486,17 +458,14 @@ export async function videoStudioRoutes(app: FastifyInstance) {
       sceneImages: Record<string, string>
     }
   }>('/video-studio/projects/:id/series/episodes', async (request, reply) => {
-    const db = getDb()
     const userId = request.user.id
     const { id } = request.params
     const { workspace_id, name, describeData, outline, characterImages, sceneImages } = request.body
 
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('workspace_id')
-      .where('workspace_id', '=', workspace_id)
-      .where('user_id', '=', userId)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id, user_id: userId },
+      select: { workspace_id: true },
+    })
     if (!member) return reply.status(403).send({ error: 'forbidden' })
     if (!outline?.episodes?.length) return reply.status(400).send({ error: 'episodes required' })
 
@@ -523,35 +492,33 @@ export async function videoStudioRoutes(app: FastifyInstance) {
       pendingVideoBatches: {},
     }
 
-    const episodes = await db.transaction().execute(async (trx) => {
-      await trx
-        .insertInto('video_studio_projects')
-        .values({
+    const episodes = await prisma.$transaction(async (trx) => {
+      await trx.videoStudioProject.upsert({
+        where: { id },
+        create: {
           id,
           workspace_id,
           user_id: userId,
           name: outline.title || name,
-          wizard_state: JSON.stringify(parentState),
+          wizard_state: parentState as Prisma.InputJsonValue,
           project_type: 'series',
           series_parent_id: null,
           episode_index: null,
-        })
-        .onConflict((oc) => oc.column('id').doUpdateSet({
+        },
+        update: {
           name: outline.title || name,
-          wizard_state: JSON.stringify(parentState) as any,
+          wizard_state: parentState as Prisma.InputJsonValue,
           project_type: 'series',
           series_parent_id: null,
           episode_index: null,
-          updated_at: sql`now()`,
-        }))
-        .execute()
+          updated_at: new Date(),
+        },
+      })
 
-      await trx
-        .updateTable('video_studio_projects')
-        .set({ is_deleted: true, deleted_at: sql`now()`, updated_at: sql`now()` })
-        .where('series_parent_id', '=', id)
-        .where('is_deleted', '=', false)
-        .execute()
+      await trx.videoStudioProject.updateMany({
+        where: { series_parent_id: id, is_deleted: false },
+        data: { is_deleted: true, deleted_at: new Date(), updated_at: new Date() },
+      })
 
       const rows = [] as Array<{ id: string; name: string; episode_index: number; wizard_state: unknown }>
       for (const [index, episode] of outline.episodes.entries()) {
@@ -593,19 +560,18 @@ export async function videoStudioRoutes(app: FastifyInstance) {
           pendingVideoBatches: {},
         }
         const episodeName = `第 ${index + 1} 集：${episode.title}`
-        await trx
-          .insertInto('video_studio_projects')
-          .values({
+        await trx.videoStudioProject.create({
+          data: {
             id: episodeId,
             workspace_id,
             user_id: userId,
             name: episodeName,
-            wizard_state: JSON.stringify(wizardState),
+            wizard_state: wizardState as Prisma.InputJsonValue,
             project_type: 'episode',
             series_parent_id: id,
             episode_index: index + 1,
-          })
-          .execute()
+          },
+        })
         rows.push({ id: episodeId, name: episodeName, episode_index: index + 1, wizard_state: wizardState })
       }
       return rows
@@ -616,17 +582,14 @@ export async function videoStudioRoutes(app: FastifyInstance) {
 
   // GET /video-studio/projects/:id/episodes
   app.get<{ Params: { id: string } }>('/video-studio/projects/:id/episodes', async (request, reply) => {
-    const db = getDb()
     const access = await assertProjectAccess(request.params.id, request.user.id)
     if (!access) return reply.status(404).send({ error: 'not found' })
 
-    const episodes = await db
-      .selectFrom('video_studio_projects')
-      .select(['id', 'name', 'created_at', 'updated_at', 'project_type', 'series_parent_id', 'episode_index', 'wizard_state'])
-      .where('series_parent_id', '=', request.params.id)
-      .where('is_deleted', '=', false)
-      .orderBy('episode_index', 'asc')
-      .execute()
+    const episodes = await prisma.videoStudioProject.findMany({
+      where: { series_parent_id: request.params.id, is_deleted: false },
+      select: { id: true, name: true, created_at: true, updated_at: true, project_type: true, series_parent_id: true, episode_index: true, wizard_state: true },
+      orderBy: { episode_index: 'asc' },
+    })
 
     return reply.send(episodes)
   })
@@ -635,7 +598,6 @@ export async function videoStudioRoutes(app: FastifyInstance) {
     Params: { id: string }
     Querystring: { limit?: string; cursor?: string }
   }>('/video-studio/projects/:id/history', async (request, reply) => {
-    const db = getDb()
     const { id } = request.params
     const limitN = Math.min(parseInt(request.query.limit ?? '30', 10) || 30, 100)
     const cursor = request.query.cursor
@@ -649,42 +611,39 @@ export async function videoStudioRoutes(app: FastifyInstance) {
       catch { return reply.badRequest('Invalid cursor') }
     }
 
-    let query = db
-      .selectFrom('task_batches')
-      .select(['id', 'model', 'prompt', 'quantity', 'completed_count', 'failed_count', 'status', 'actual_credits', 'created_at', 'module', 'provider'])
-      .where('video_studio_project_id', '=', id)
-      .where('is_deleted', '=', false)
-      .orderBy('created_at', 'desc')
-      .orderBy('id', 'desc')
-      .limit(limitN + 1) as any
+    const rows = await prisma.taskBatch.findMany({
+      where: {
+        video_studio_project_id: id,
+        is_deleted: false,
+        ...(decodedCursor ? {
+          OR: [
+            { created_at: { lt: new Date(decodedCursor.created_at) } },
+            { created_at: new Date(decodedCursor.created_at), id: { lt: decodedCursor.id } },
+          ],
+        } : {}),
+      },
+      select: { id: true, model: true, prompt: true, quantity: true, completed_count: true, failed_count: true, status: true, actual_credits: true, created_at: true, module: true, provider: true },
+      orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+      take: limitN + 1,
+    })
 
-    if (decodedCursor) {
-      query = query.where((eb: any) => eb.or([
-        eb('created_at', '<', decodedCursor!.created_at),
-        eb.and([eb('created_at', '=', decodedCursor!.created_at), eb('id', '<', decodedCursor!.id)]),
-      ]))
-    }
-
-    const rows = await query.execute()
     const hasMore = rows.length > limitN
-    const items = await Promise.all((hasMore ? rows.slice(0, limitN) : rows).map(async (batch: any) => {
+    const items = await Promise.all((hasMore ? rows.slice(0, limitN) : rows).map(async (batch) => {
       const queuePosition = batch.status === 'pending'
-        ? Number((await db
-            .selectFrom('task_batches')
-            .select((eb: any) => eb.fn.countAll().as('count'))
-            .where('is_deleted', '=', false)
-            .where('status', '=', 'pending')
-            .where('provider', '=', batch.provider)
-            .where('created_at', '<', batch.created_at)
-            .executeTakeFirst() as any)?.count ?? 0)
+        ? await prisma.taskBatch.count({
+            where: {
+              is_deleted: false,
+              status: 'pending',
+              provider: batch.provider,
+              created_at: { lt: batch.created_at },
+            },
+          })
         : null
-      const processing = await db
-        .selectFrom('tasks')
-        .select('processing_started_at')
-        .where('batch_id', '=', batch.id)
-        .where('processing_started_at', 'is not', null)
-        .orderBy('processing_started_at', 'asc')
-        .executeTakeFirst()
+      const processing = await prisma.task.findFirst({
+        where: { batch_id: batch.id, processing_started_at: { not: null } },
+        select: { processing_started_at: true },
+        orderBy: { processing_started_at: 'asc' },
+      })
       const { provider: _provider, ...item } = batch
       return { ...item, canvas_node_id: null, queue_position: queuePosition, processing_started_at: processing?.processing_started_at ?? null }
     }))
@@ -701,7 +660,6 @@ export async function videoStudioRoutes(app: FastifyInstance) {
     Params: { id: string }
     Querystring: { limit?: string; cursor?: string; type?: string }
   }>('/video-studio/projects/:id/assets', async (request, reply) => {
-    const db = getDb()
     const { id } = request.params
     const limitN = Math.min(parseInt(request.query.limit ?? '50', 10) || 50, 200)
     const cursor = request.query.cursor
@@ -716,37 +674,45 @@ export async function videoStudioRoutes(app: FastifyInstance) {
       catch { return reply.badRequest('Invalid cursor') }
     }
 
-    let query = db
-      .selectFrom('assets as a')
-      .innerJoin('task_batches as b', 'b.id', 'a.batch_id')
-      .select(['a.id', 'a.type', 'a.storage_url', 'a.original_url', 'a.created_at', 'b.id as batch_id', 'b.prompt', 'b.model'])
-      .where('b.video_studio_project_id', '=', id)
-      .where('a.is_deleted', '=', false)
-      .where((eb: any) => eb.or([
-        eb('a.transfer_status', '=', 'completed'),
-        eb('a.original_url', 'is not', null),
-      ]))
-      .orderBy('a.created_at', 'desc')
-      .orderBy('a.id', 'desc')
-      .limit(limitN + 1) as any
+    const rows = await prisma.asset.findMany({
+      where: {
+        is_deleted: false,
+        batch: { video_studio_project_id: id },
+        ...(type ? { type: type as AssetType } : {}),
+        OR: [
+          { transfer_status: 'completed' },
+          { original_url: { not: null } },
+        ],
+        ...(decodedCursor ? {
+          AND: [
+            {
+              OR: [
+                { created_at: { lt: new Date(decodedCursor.created_at) } },
+                { created_at: new Date(decodedCursor.created_at), id: { lt: decodedCursor.id } },
+              ],
+            },
+          ],
+        } : {}),
+      },
+      include: {
+        batch: { select: { id: true, prompt: true, model: true } },
+      },
+      orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+      take: limitN + 1,
+    })
 
-    if (type) query = query.where('a.type', '=', type)
-
-    if (decodedCursor) {
-      query = query.where((eb: any) => eb.or([
-        eb('a.created_at', '<', decodedCursor!.created_at),
-        eb.and([eb('a.created_at', '=', decodedCursor!.created_at), eb('a.id', '<', decodedCursor!.id)]),
-      ]))
-    }
-
-    const rows = await query.execute()
     const hasMore = rows.length > limitN
     const items = hasMore ? rows.slice(0, limitN) : rows
-    const signedItems = await Promise.all(items.map(async (item: any) => ({
-      ...item,
-      canvas_node_id: null,
+    const signedItems = await Promise.all(items.map(async (item) => ({
+      id: item.id,
+      type: item.type,
       storage_url: await signAssetUrl(item.storage_url),
       original_url: item.original_url ? await signAssetUrl(item.original_url) : null,
+      created_at: item.created_at,
+      batch_id: item.batch?.id ?? null,
+      prompt: item.batch?.prompt ?? null,
+      model: item.batch?.model ?? null,
+      canvas_node_id: null,
     })))
 
     const nextCursor = hasMore
@@ -772,19 +738,16 @@ export async function videoStudioRoutes(app: FastifyInstance) {
       },
     },
     async (request, reply) => {
-      const db = getDb()
       const name = request.body.name.trim()
       if (!name) return reply.status(400).send({ error: 'name required' })
 
       const access = await assertProjectAccess(request.params.id, request.user.id, true)
       if (!access) return reply.status(404).send({ error: 'not found' })
 
-      await db
-        .updateTable('video_studio_projects')
-        .set({ name, updated_at: sql`now()` })
-        .where('id', '=', request.params.id)
-        .where('is_deleted', '=', false)
-        .execute()
+      await prisma.videoStudioProject.updateMany({
+        where: { id: request.params.id, is_deleted: false },
+        data: { name, updated_at: new Date() },
+      })
 
       return reply.send({ success: true, name })
     },
@@ -794,19 +757,14 @@ export async function videoStudioRoutes(app: FastifyInstance) {
   app.delete<{ Params: { id: string } }>(
     '/video-studio/projects/:id',
     async (request, reply) => {
-      const db = getDb()
       const access = await assertProjectAccess(request.params.id, request.user.id, true)
       if (!access) return reply.status(404).send({ error: 'not found' })
 
-      await db.transaction().execute(async (trx) => {
-        await trx
-          .updateTable('video_studio_projects')
-          .set({ is_deleted: true, deleted_at: sql`now()`, updated_at: sql`now()` })
-          .where('id', '=', request.params.id)
-          .where('is_deleted', '=', false)
-          .execute()
-        await softDeleteProjectAssets(trx, 'video_studio_project_id', request.params.id)
+      await prisma.videoStudioProject.updateMany({
+        where: { id: request.params.id, is_deleted: false },
+        data: { is_deleted: true, deleted_at: new Date(), updated_at: new Date() },
       })
+      await softDeleteProjectAssets('video_studio_project_id', request.params.id)
 
       return reply.send({ success: true })
     },
@@ -814,57 +772,49 @@ export async function videoStudioRoutes(app: FastifyInstance) {
 
   // GET /video-studio/projects/trash
   app.get<{ Querystring: { workspace_id: string } }>('/video-studio/projects/trash', async (request, reply) => {
-    const db = getDb()
     const userId = request.user.id
     const { workspace_id } = request.query
     if (!workspace_id) return reply.status(400).send({ error: 'workspace_id required' })
 
-    const member = await db
-      .selectFrom('workspace_members')
-      .select('role')
-      .where('workspace_id', '=', workspace_id)
-      .where('user_id', '=', userId)
-      .executeTakeFirst()
+    const member = await prisma.workspaceMember.findFirst({
+      where: { workspace_id, user_id: userId },
+      select: { role: true },
+    })
     if (!member) return reply.status(403).send({ error: 'forbidden' })
 
-    const projects = await db
-      .selectFrom('video_studio_projects')
-      .select(['id', 'name', 'created_at', 'updated_at', 'deleted_at', 'user_id', 'workspace_id'])
-      .where('workspace_id', '=', workspace_id)
-      .where('is_deleted', '=', true)
-      .where((eb) => member.role === 'admin' ? eb.val(true) : eb('user_id', '=', userId))
-      .orderBy('deleted_at', 'desc')
-      .execute()
+    const projects = await prisma.videoStudioProject.findMany({
+      where: {
+        workspace_id,
+        is_deleted: true,
+        ...(member.role === 'admin' ? {} : { user_id: userId }),
+      },
+      select: { id: true, name: true, created_at: true, updated_at: true, deleted_at: true, user_id: true, workspace_id: true },
+      orderBy: { deleted_at: 'desc' },
+    })
 
     return reply.send(projects)
   })
 
   // POST /video-studio/projects/:id/restore
   app.post<{ Params: { id: string } }>('/video-studio/projects/:id/restore', async (request, reply) => {
-    const db = getDb()
     const access = await assertProjectAccess(request.params.id, request.user.id, true)
     if (!access) return reply.status(404).send({ error: 'not found' })
 
-    await db.transaction().execute(async (trx) => {
-      await trx
-        .updateTable('video_studio_projects')
-        .set({ is_deleted: false, deleted_at: null, updated_at: sql`now()` })
-        .where('id', '=', request.params.id)
-        .where('is_deleted', '=', true)
-        .execute()
-      await restoreProjectAssets(trx, 'video_studio_project_id', request.params.id)
+    await prisma.videoStudioProject.updateMany({
+      where: { id: request.params.id, is_deleted: true },
+      data: { is_deleted: false, deleted_at: null, updated_at: new Date() },
     })
+    await restoreProjectAssets('video_studio_project_id', request.params.id)
 
     return reply.send({ success: true })
   })
 
   // DELETE /video-studio/projects/:id/permanent
   app.delete<{ Params: { id: string } }>('/video-studio/projects/:id/permanent', async (request, reply) => {
-    const db = getDb()
     const access = await assertProjectAccess(request.params.id, request.user.id, true)
     if (!access) return reply.status(404).send({ error: 'not found' })
 
-    await purgeVideoStudioProject(db, request.params.id)
+    await purgeVideoStudioProject(prisma, request.params.id)
     return reply.send({ success: true })
   })
 }

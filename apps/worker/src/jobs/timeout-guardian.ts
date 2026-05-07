@@ -1,8 +1,7 @@
-import { getDb } from '@aigc/db'
 import { Queue } from 'bullmq'
 import pino_ from 'pino'
-import { sql } from 'kysely'
 import type { GenerationJobData } from '@aigc/types'
+import { prisma } from '../lib/prisma.js'
 import { failPipeline } from '../pipelines/fail.js'
 import { getRedis } from '../lib/redis.js'
 
@@ -17,90 +16,78 @@ function getImageQueue(): Queue {
   return _imageQueue
 }
 
-const TIMEOUT_MS = 6 * 60 * 1000 // 6 minutes (slightly longer than API timeout to allow completion)
-const MAX_RETRIES = 0 // Disabled: no retries, fail immediately on timeout
+const TIMEOUT_MS = 6 * 60 * 1000
+const MAX_RETRIES = 0
 
 export async function runTimeoutGuardian(): Promise<void> {
-  const db = getDb()
-  const cutoff = new Date(Date.now() - TIMEOUT_MS).toISOString()
+  const cutoff = new Date(Date.now() - TIMEOUT_MS)
 
-  // Find stuck tasks: pending or processing for >6 minutes
-  const stuckTasks = await db
-    .selectFrom('tasks')
-    .innerJoin('task_batches', 'task_batches.id', 'tasks.batch_id')
-    .select([
-      'tasks.id as taskId',
-      'tasks.batch_id as batchId',
-      'tasks.user_id as userId',
-      'tasks.retry_count',
-      'tasks.estimated_credits',
-      'tasks.queue_job_id',
-      'tasks.status',
-      'task_batches.provider',
-      'task_batches.model',
-      'task_batches.module as module',
-      'task_batches.prompt',
-      'task_batches.params',
-      'task_batches.team_id as teamId',
-      'task_batches.credit_account_id as creditAccountId',
-    ])
-    .where((eb: any) =>
-      eb.or([
-        // Pending tasks: use batch created_at as reference
-        eb.and([
-          eb('tasks.status', '=', 'pending'),
-          eb('task_batches.created_at', '<', cutoff),
-        ]),
-        // Processing tasks: use processing_started_at
-        eb.and([
-          eb('tasks.status', '=', 'processing'),
-          eb('tasks.processing_started_at', '<', cutoff),
-        ]),
-      ]),
-    )
-    .execute()
+  const stuckTasks = await prisma.task.findMany({
+    where: {
+      OR: [
+        { status: 'pending', batch: { created_at: { lt: cutoff } } },
+        { status: 'processing', processing_started_at: { lt: cutoff } },
+      ],
+    },
+    select: {
+      id: true,
+      batch_id: true,
+      user_id: true,
+      retry_count: true,
+      estimated_credits: true,
+      queue_job_id: true,
+      status: true,
+      batch: {
+        select: {
+          provider: true,
+          model: true,
+          module: true,
+          prompt: true,
+          params: true,
+          team_id: true,
+          credit_account_id: true,
+        },
+      },
+    },
+  })
 
   if (stuckTasks.length === 0) return
-
   logger.info({ count: stuckTasks.length }, 'Found stuck tasks')
 
   for (const task of stuckTasks) {
-    // Video tasks are managed by the video poller (which has its own 15-min timeout)
-    // Re-enqueueing them to imageQueue would incorrectly process them as image tasks
-    if ((task as any).module === 'video') {
-      logger.debug({ taskId: task.taskId }, 'Skipping video task in timeout guardian (handled by video poller)')
+    // 视频任务由 video-poller 管理，跳过
+    if (task.batch?.module === 'video') {
+      logger.debug({ taskId: task.id }, 'Skipping video task in timeout guardian (handled by video poller)')
       continue
     }
 
-    if (!task.teamId || !task.creditAccountId) {
-      logger.warn({ taskId: task.taskId }, 'Stuck task missing teamId or creditAccountId, marking failed')
-      await db
-        .updateTable('tasks')
-        .set({ status: 'failed', error_message: 'Missing team/credit context', completed_at: new Date().toISOString() })
-        .where('id', '=', task.taskId)
-        .execute()
+    if (!task.batch?.team_id || !task.batch?.credit_account_id) {
+      logger.warn({ taskId: task.id }, 'Stuck task missing teamId or creditAccountId, marking failed')
+      await prisma.task.update({
+        where: { id: task.id },
+        data: { status: 'failed', error_message: 'Missing team/credit context', completed_at: new Date() },
+      })
       continue
     }
 
     const jobData: GenerationJobData = {
-      taskId: task.taskId,
-      batchId: task.batchId,
-      userId: task.userId,
-      teamId: task.teamId,
-      creditAccountId: task.creditAccountId,
-      provider: task.provider,
-      model: task.model,
-      prompt: task.prompt,
-      params: (typeof task.params === 'string' ? JSON.parse(task.params) : task.params) as Record<string, unknown>,
+      taskId: task.id,
+      batchId: task.batch_id,
+      userId: task.user_id,
+      teamId: task.batch.team_id,
+      creditAccountId: task.batch.credit_account_id,
+      provider: task.batch.provider,
+      model: task.batch.model,
+      prompt: task.batch.prompt,
+      params: (typeof task.batch.params === 'string' ? JSON.parse(task.batch.params) : task.batch.params) as Record<string, unknown>,
       estimatedCredits: task.estimated_credits,
     }
 
-    // No retry: directly fail stuck tasks and refund credits
-    logger.warn({ taskId: task.taskId }, 'Task timed out, failing immediately (no retry)')
+    logger.warn({ taskId: task.id }, 'Task timed out, failing immediately (no retry)')
     try {
       await failPipeline(jobData, 'Task timed out')
     } catch (err) {
-      logger.error({ taskId: task.taskId, error: err }, 'failPipeline threw during timeout handling — credits may be frozen')
+      logger.error({ taskId: task.id, error: err }, 'failPipeline threw during timeout handling — credits may be frozen')
     }
   }
 }

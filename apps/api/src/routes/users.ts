@@ -1,13 +1,12 @@
 import type { FastifyInstance } from 'fastify'
-import { getDb } from '@aigc/db'
+import { prisma } from '../lib/prisma.js'
 import bcrypt from 'bcryptjs'
 import { buildUserProfile } from '../services/user-profile.js'
 
 export async function userRoutes(app: FastifyInstance): Promise<void> {
   // GET /users/me
   app.get('/users/me', async (request) => {
-    const db = getDb()
-    return buildUserProfile(db, request.user.id)
+    return buildUserProfile(prisma, request.user.id)
   })
 
   // PATCH /users/me
@@ -28,7 +27,6 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
       return reply.badRequest('At least one field (username, avatar_url) is required')
     }
 
-    const db = getDb()
     const updates: Record<string, unknown> = {}
 
     if (username) {
@@ -54,13 +52,12 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    await db
-      .updateTable('users')
-      .set(updates)
-      .where('id', '=', request.user.id)
-      .execute()
+    await prisma.user.update({
+      where: { id: request.user.id },
+      data: updates,
+    })
 
-    return buildUserProfile(db, request.user.id)
+    return buildUserProfile(prisma, request.user.id)
   })
 
   // POST /users/me/password — change password
@@ -85,14 +82,19 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
       return reply.badRequest('新密码必须包含字母和数字')
     }
 
-    const db = getDb()
-    const user = await db
-      .selectFrom('users')
-      .select(['id', 'password_hash'])
-      .where('id', '=', request.user.id)
-      .executeTakeFirstOrThrow()
+    const user = await prisma.user.findUnique({
+      where: { id: request.user.id },
+      select: { id: true, password_hash: true },
+    })
 
-    const valid = await bcrypt.compare(current_password, user.password_hash)
+    if (!user) {
+      return reply.status(404).send({
+        success: false,
+        error: { code: 'USER_NOT_FOUND', message: '用户不存在' },
+      })
+    }
+
+    const valid = user.password_hash ? await bcrypt.compare(current_password, user.password_hash) : false
     if (!valid) {
       return reply.status(400).send({
         success: false,
@@ -101,23 +103,25 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const newHash = await bcrypt.hash(new_password, 12)
-    await db
-      .updateTable('users')
-      .set({ password_hash: newHash, password_change_required: false })
-      .where('id', '=', user.id)
-      .execute()
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { password_hash: newHash, password_change_required: false },
+    })
 
     return { success: true }
   })
 
   // GET /users/me/generation-defaults
   app.get('/users/me/generation-defaults', async (request) => {
-    const db = getDb()
-    const user = await db
-      .selectFrom('users')
-      .select('generation_defaults')
-      .where('id', '=', request.user.id)
-      .executeTakeFirstOrThrow()
+    const user = await prisma.user.findUnique({
+      where: { id: request.user.id },
+      select: { generation_defaults: true },
+    })
+
+    if (!user) {
+      return {}
+    }
+
     return user.generation_defaults ?? {}
   })
 
@@ -127,12 +131,11 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
       body: { type: 'object', additionalProperties: true },
     },
   }, async (request) => {
-    const db = getDb()
-    await db
-      .updateTable('users')
-      .set({ generation_defaults: JSON.stringify(request.body) })
-      .where('id', '=', request.user.id)
-      .execute()
+    // Prisma 自动处理 JSON 字段，无需 JSON.stringify
+    await prisma.user.update({
+      where: { id: request.user.id },
+      data: { generation_defaults: request.body as import("@prisma/client").Prisma.InputJsonValue },
+    })
     return request.body
   })
 }

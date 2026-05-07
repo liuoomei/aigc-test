@@ -1,6 +1,6 @@
-import { getDb } from '@aigc/db'
 import { DeleteObjectCommand } from '@aws-sdk/client-s3'
 import pino_ from 'pino'
+import { prisma } from '../lib/prisma.js'
 import { getBucket, getPublicUrl, getS3 } from '../lib/storage.js'
 
 const pino = pino_ as any
@@ -26,64 +26,80 @@ async function deleteStoredUrls(urls: Array<string | null | undefined>) {
 }
 
 async function purgeCanvasProject(canvasId: string) {
-  const db = getDb()
-  const canvas = await db.selectFrom('canvases').select('thumbnail_url').where('id', '=', canvasId).executeTakeFirst()
+  const canvas = await prisma.canvas.findFirst({
+    where: { id: canvasId },
+    select: { thumbnail_url: true },
+  })
   if (!canvas) return
 
-  const assetRows = await db
-    .selectFrom('assets as a')
-    .innerJoin('task_batches as b', 'b.id', 'a.batch_id')
-    .select(['a.storage_url', 'a.original_url', 'a.thumbnail_url'])
-    .where('b.canvas_id', '=', canvasId)
-    .execute()
+  const assetRows = await prisma.asset.findMany({
+    where: { batch: { canvas_id: canvasId } },
+    select: { storage_url: true, original_url: true, thumbnail_url: true },
+  })
 
-  const outputRows = await db
-    .selectFrom('canvas_node_outputs')
-    .select('output_urls')
-    .where('canvas_id', '=', canvasId)
-    .execute()
+  const outputRows = await prisma.canvasNodeOutput.findMany({
+    where: { canvas_id: canvasId },
+    select: { output_urls: true },
+  })
 
   await deleteStoredUrls([
     canvas.thumbnail_url,
     ...assetRows.flatMap((row) => [row.storage_url, row.original_url, row.thumbnail_url]),
-    ...outputRows.flatMap((row) => row.output_urls ?? []),
+    ...outputRows.flatMap((row) => (row.output_urls as string[]) ?? []),
   ])
 
-  await db.transaction().execute(async (trx) => {
-    await trx.deleteFrom('assets').where('batch_id', 'in', trx.selectFrom('task_batches').select('id').where('canvas_id', '=', canvasId)).execute()
-    await trx.deleteFrom('canvas_node_outputs').where('canvas_id', '=', canvasId).execute()
-    await trx.updateTable('task_batches').set({ canvas_id: null, canvas_node_id: null }).where('canvas_id', '=', canvasId).execute()
-    await trx.deleteFrom('canvases').where('id', '=', canvasId).execute()
-  })
+  await prisma.$transaction([
+    prisma.asset.deleteMany({
+      where: { batch: { canvas_id: canvasId } },
+    }),
+    prisma.canvasNodeOutput.deleteMany({ where: { canvas_id: canvasId } }),
+    prisma.taskBatch.updateMany({
+      where: { canvas_id: canvasId },
+      data: { canvas_id: null, canvas_node_id: null },
+    }),
+    prisma.canvas.delete({ where: { id: canvasId } }),
+  ])
 }
 
 async function purgeVideoStudioProject(projectId: string) {
-  const db = getDb()
-  const project = await db.selectFrom('video_studio_projects').select('id').where('id', '=', projectId).executeTakeFirst()
+  const project = await prisma.videoStudioProject.findFirst({
+    where: { id: projectId },
+    select: { id: true },
+  })
   if (!project) return
 
-  const assetRows = await db
-    .selectFrom('assets as a')
-    .innerJoin('task_batches as b', 'b.id', 'a.batch_id')
-    .select(['a.storage_url', 'a.original_url', 'a.thumbnail_url'])
-    .where('b.video_studio_project_id', '=', projectId)
-    .execute()
+  const assetRows = await prisma.asset.findMany({
+    where: { batch: { video_studio_project_id: projectId } },
+    select: { storage_url: true, original_url: true, thumbnail_url: true },
+  })
 
   await deleteStoredUrls(assetRows.flatMap((row) => [row.storage_url, row.original_url, row.thumbnail_url]))
 
-  await db.transaction().execute(async (trx) => {
-    await trx.deleteFrom('assets').where('batch_id', 'in', trx.selectFrom('task_batches').select('id').where('video_studio_project_id', '=', projectId)).execute()
-    await trx.updateTable('task_batches').set({ video_studio_project_id: null }).where('video_studio_project_id', '=', projectId).execute()
-    await trx.deleteFrom('video_studio_projects').where('id', '=', projectId).execute()
-  })
+  await prisma.$transaction([
+    prisma.asset.deleteMany({
+      where: { batch: { video_studio_project_id: projectId } },
+    }),
+    prisma.taskBatch.updateMany({
+      where: { video_studio_project_id: projectId },
+      data: { video_studio_project_id: null },
+    }),
+    prisma.videoStudioProject.delete({ where: { id: projectId } }),
+  ])
 }
 
 export async function runPurgeDeletedProjects(): Promise<void> {
-  const db = getDb()
   const cutoff = new Date(Date.now() - PROJECT_RETENTION_DAYS * 24 * 60 * 60 * 1000)
 
-  const canvases = await db.selectFrom('canvases').select('id').where('is_deleted', '=', true).where('deleted_at', '<', cutoff as any).limit(100).execute()
-  const videoProjects = await db.selectFrom('video_studio_projects').select('id').where('is_deleted', '=', true).where('deleted_at', '<', cutoff as any).limit(100).execute()
+  const canvases = await prisma.canvas.findMany({
+    where: { is_deleted: true, deleted_at: { lt: cutoff } },
+    select: { id: true },
+    take: 100,
+  })
+  const videoProjects = await prisma.videoStudioProject.findMany({
+    where: { is_deleted: true, deleted_at: { lt: cutoff } },
+    select: { id: true },
+    take: 100,
+  })
 
   let purgedCanvases = 0
   let purgedVideoProjects = 0

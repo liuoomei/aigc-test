@@ -4,8 +4,7 @@ import { unlink, mkdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { pipeline } from 'node:stream/promises'
-import { getDb } from '@aigc/db'
-import { sql } from 'kysely'
+import { prisma } from '../lib/prisma.js'
 import { freezeCredits, refundCredits } from '../services/credit.js'
 import { buildSignedRequest } from '../lib/volcengine-visual-sign.js'
 
@@ -98,16 +97,19 @@ export async function actionImitationRoutes(app: FastifyInstance): Promise<void>
   }, async (request, reply) => {
     const { workspace_id: workspaceId, image_base64, image_mime, video_url, video_duration } = request.body
     const userId = request.user.id
-    const db = getDb()
 
     // Verify workspace membership
-    const wsMember = await db
-      .selectFrom('workspace_members')
-      .innerJoin('workspaces', 'workspaces.id', 'workspace_members.workspace_id')
-      .select(['workspaces.team_id', 'workspace_members.role'])
-      .where('workspace_members.workspace_id', '=', workspaceId)
-      .where('workspace_members.user_id', '=', userId)
-      .executeTakeFirst()
+    const wsMember = await prisma.workspaceMember.findFirst({
+      where: {
+        workspace_id: workspaceId,
+        user_id: userId,
+      },
+      include: {
+        workspace: {
+          select: { team_id: true },
+        },
+      },
+    })
 
     if (!wsMember && request.user.role !== 'admin') {
       return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '你不是此工作区的成员' } })
@@ -118,33 +120,42 @@ export async function actionImitationRoutes(app: FastifyInstance): Promise<void>
 
     let teamId: string
     if (wsMember) {
-      teamId = wsMember.team_id
+      if (!wsMember.workspace.team_id) {
+        return reply.status(400).send({ success: false, error: { code: 'NO_TEAM', message: '工作区未关联团队' } })
+      }
+      teamId = wsMember.workspace.team_id
     } else {
-      const workspace = await db.selectFrom('workspaces').select('team_id').where('id', '=', workspaceId).executeTakeFirst()
+      const workspace = await prisma.workspace.findUnique({
+        where: { id: workspaceId },
+        select: { team_id: true },
+      })
       if (!workspace) return reply.status(404).send({ success: false, error: { code: 'NOT_FOUND', message: '工作区未找到' } })
+      if (!workspace.team_id) {
+        return reply.status(400).send({ success: false, error: { code: 'NO_TEAM', message: '工作区未关联团队' } })
+      }
       teamId = workspace.team_id
     }
 
-    const team = await db
-      .selectFrom('teams')
-      .select('team_type')
-      .where('id', '=', teamId)
-      .executeTakeFirst()
+    const team = await prisma.team.findUnique({
+      where: { id: teamId },
+      select: { team_type: true },
+    })
 
     if (!team || (team.team_type !== 'standard' && team.team_type !== 'avatar_enabled')) {
       return reply.status(403).send({ success: false, error: { code: 'ACTION_IMITATION_DISABLED', message: '当前团队未开通动作模仿能力' } })
     }
 
     // Check concurrent action_imitation tasks — API only supports 1 concurrent
-    const activeTasks = await db
-      .selectFrom('tasks')
-      .innerJoin('task_batches', 'tasks.batch_id', 'task_batches.id')
-      .select(db.fn.count('tasks.id').as('count'))
-      .where('tasks.status', '=', 'processing')
-      .where('task_batches.module', '=', 'action_imitation' as any)
-      .executeTakeFirstOrThrow()
+    const activeTasks = await prisma.task.count({
+      where: {
+        status: 'processing',
+        batch: {
+          module: 'action_imitation',
+        },
+      },
+    })
 
-    if (Number(activeTasks.count) >= 1) {
+    if (activeTasks >= 1) {
       return reply.status(429).send({
         success: false,
         error: { code: 'ACTION_IMITATION_CONCURRENT_LIMIT', message: '动作模仿同时只支持1个任务，请等待当前任务完成后再提交' },
@@ -169,10 +180,9 @@ export async function actionImitationRoutes(app: FastifyInstance): Promise<void>
     let batchId: string
     let taskId: string
     try {
-      const _bt = await db.transaction().execute(async (trx: any) => {
-        const batchResult = await trx
-          .insertInto('task_batches')
-          .values({
+      const result = await prisma.$transaction(async (tx) => {
+        const batchResult = await tx.taskBatch.create({
+          data: {
             idempotency_key: randomUUID(),
             user_id: userId,
             team_id: teamId,
@@ -189,27 +199,24 @@ export async function actionImitationRoutes(app: FastifyInstance): Promise<void>
             quantity: 1,
             status: 'processing',
             estimated_credits: estimatedCredits,
-          })
-          .returning('id')
-          .executeTakeFirstOrThrow()
+          },
+        })
 
-        const taskResult = await trx
-          .insertInto('tasks')
-          .values({
+        const taskResult = await tx.task.create({
+          data: {
             batch_id: batchResult.id,
             user_id: userId,
             version_index: 0,
             estimated_credits: estimatedCredits,
             status: 'processing',
-            processing_started_at: new Date().toISOString(),
-          })
-          .returning('id')
-          .executeTakeFirstOrThrow()
+            processing_started_at: new Date(),
+          },
+        })
 
         return { batchId: batchResult.id, taskId: taskResult.id }
       })
-      batchId = _bt.batchId
-      taskId = _bt.taskId
+      batchId = result.batchId
+      taskId = result.taskId
     } catch (err) {
       app.log.error({ err }, 'Failed to create action_imitation batch/task, refunding credits')
       try { await refundCredits(teamId, creditAccountId, userId, estimatedCredits) } catch { /* ignore */ }
@@ -248,18 +255,43 @@ export async function actionImitationRoutes(app: FastifyInstance): Promise<void>
     }
 
     if (!externalTaskId) {
-      await db.transaction().execute(async (trx: any) => {
-        await trx.updateTable('tasks').set({ status: 'failed', error_message: lastError.slice(0, 1000), completed_at: new Date().toISOString() }).where('id', '=', taskId).execute()
-        await trx.updateTable('task_batches').set({ status: 'failed', failed_count: sql`failed_count + 1` }).where('id', '=', batchId).execute()
-        await trx.updateTable('credit_accounts').set({ frozen_credits: sql`frozen_credits - ${estimatedCredits}` }).where('id', '=', creditAccountId).execute()
-        await trx.updateTable('team_members').set({ credit_used: sql`GREATEST(credit_used - ${estimatedCredits}, 0)` }).where('team_id', '=', teamId).where('user_id', '=', userId).execute()
-        await trx.insertInto('credits_ledger').values({ credit_account_id: creditAccountId, user_id: userId, amount: estimatedCredits, type: 'refund', task_id: taskId, batch_id: batchId, description: `Action Imitation failed to submit: ${lastError.slice(0, 200)}` }).execute()
+      await prisma.$transaction(async (tx) => {
+        await tx.task.update({
+          where: { id: taskId },
+          data: { status: 'failed', error_message: lastError.slice(0, 1000), completed_at: new Date() },
+        })
+        await tx.taskBatch.update({
+          where: { id: batchId },
+          data: { status: 'failed', failed_count: { increment: 1 } },
+        })
+        await tx.creditAccount.update({
+          where: { id: creditAccountId },
+          data: { frozen_credits: { decrement: estimatedCredits } },
+        })
+        await tx.teamMember.update({
+          where: { team_id_user_id: { team_id: teamId, user_id: userId } },
+          data: { credit_used: { decrement: estimatedCredits } },
+        })
+        await tx.creditsLedger.create({
+          data: {
+            credit_account_id: creditAccountId,
+            user_id: userId,
+            amount: estimatedCredits,
+            type: 'refund',
+            task_id: taskId,
+            batch_id: batchId,
+            description: `Action Imitation failed to submit: ${lastError.slice(0, 200)}`,
+          },
+        })
       })
       try { await (request.server as any).redis.publish(`sse:batch:${batchId}`, JSON.stringify({ event: 'batch_update' })) } catch { /* ignore */ }
       return reply.status(502).send({ success: false, error: { code: 'ACTION_IMITATION_API_ERROR', message: `动作模仿服务暂时不可用：${lastError.slice(0, 300)}` } })
     }
 
-    await db.updateTable('tasks').set({ external_task_id: externalTaskId }).where('id', '=', taskId).execute()
+    await prisma.task.update({
+      where: { id: taskId },
+      data: { external_task_id: externalTaskId },
+    })
 
     return reply.status(201).send({
       id: batchId,
