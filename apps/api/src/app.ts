@@ -4,6 +4,7 @@ import cookie from '@fastify/cookie'
 import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
+import multipart from '@fastify/multipart'
 import Redis from 'ioredis'
 import { jwtAuthPlugin } from './plugins/jwt-auth.js'
 import { healthzRoutes } from './routes/healthz.js'
@@ -18,7 +19,6 @@ import { adminRoutes } from './routes/admin.js'
 import { proxyRoutes } from './routes/proxy.js'
 import { assetRoutes } from './routes/assets.js'
 import { videoRoutes } from './routes/videos.js'
-import multipart from '@fastify/multipart'
 import { aiAssistantRoutes } from './routes/ai-assistant.js'
 import { avatarRoutes } from './routes/avatar.js'
 import { actionImitationRoutes } from './routes/action-imitation.js'
@@ -29,19 +29,22 @@ import { companyARoutes } from './routes/company-a.js'
 import { clientErrorsRoutes } from './routes/client-errors.js'
 import { paymentRoutes } from './routes/payment.js'
 
+// Fastify 5 日志配置：开发环境使用 pino-pretty 美化输出
+const isDev = process.env.NODE_ENV === 'development'
+
 export async function buildApp() {
   const app = Fastify({
-    logger: {
-      level: process.env.LOG_LEVEL ?? 'info',
-    },
-    bodyLimit: 100 * 1024 * 1024, // 100 MB — supports up to 10 reference images at 20 MB each (base64 overhead ~33%)
+    logger: isDev
+      ? { level: process.env.LOG_LEVEL ?? 'info', transport: { target: 'pino-pretty' } }
+      : { level: process.env.LOG_LEVEL ?? 'info' },
+    bodyLimit: 100 * 1024 * 1024, // 100 MB
   })
 
   await app.register(sensible)
   await app.register(cookie)
   await app.register(multipart, { limits: { fileSize: 100 * 1024 * 1024 } })
 
-  // CORS — restrict to allowed origins
+  // CORS
   const allowedOrigins = (process.env.CORS_ORIGIN ?? 'http://localhost:3000').split(',').map(s => s.trim())
   await app.register(cors, {
     origin: allowedOrigins,
@@ -52,10 +55,10 @@ export async function buildApp() {
 
   // Security headers
   await app.register(helmet, {
-    contentSecurityPolicy: false, // managed by Next.js for frontend
+    contentSecurityPolicy: false,
   })
 
-  // Attach Redis client
+  // Redis client
   const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379')
   app.decorate('redis', redis)
 
@@ -63,20 +66,15 @@ export async function buildApp() {
     await redis.quit()
   })
 
-  // Global rate limit: 1200 requests per minute per client identity.
-  // Fine-grained routes (e.g. login/generate) define stricter per-route limits.
-  // Keyed by Authorization header user-id when present, falling back to IP — prevents NAT/proxy users from sharing a bucket
+  // Rate limit
   await app.register(rateLimit, {
     global: true,
     max: 1200,
     timeWindow: '1 minute',
     redis,
     keyGenerator: (request) => {
-      // If an Authorization header is present, key by the bearer token prefix (first 16 chars are unique per user)
-      // This stops multiple users behind the same NAT from colliding in the same bucket
       const auth = request.headers.authorization
       if (auth?.startsWith('Bearer ')) {
-        // Use first 16 chars of the token as a per-user discriminator (not the full token for security)
         const tokenPrefix = auth.slice(7, 23)
         return `${request.ip}:${tokenPrefix}`
       }
@@ -92,7 +90,7 @@ export async function buildApp() {
   // Plugins
   await app.register(jwtAuthPlugin)
 
-  // Routes — all prefixed with /api/v1
+  // Routes — prefixed with /api/v1
   await app.register(
     async (v1) => {
       await v1.register(authRoutes)
@@ -119,6 +117,26 @@ export async function buildApp() {
     },
     { prefix: '/api/v1' },
   )
+
+  // 全局错误处理
+  app.setErrorHandler((error, request, reply) => {
+    app.log.error(error)
+
+    if (error.validation) {
+      return reply.status(400).send({
+        statusCode: 400,
+        success: false,
+        error: { code: 'VALIDATION_ERROR', message: error.message },
+      })
+    }
+
+    const statusCode = error.statusCode ?? 500
+    return reply.status(statusCode).send({
+      statusCode,
+      success: false,
+      error: { code: error.code ?? 'INTERNAL_ERROR', message: error.message },
+    })
+  })
 
   return app
 }
