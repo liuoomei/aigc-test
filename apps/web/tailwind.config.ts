@@ -1,20 +1,11 @@
 import type { Config } from 'tailwindcss'
-import tailwindAnimate from 'tailwindcss-animate'
-import typography from '@tailwindcss/typography'
 
+// Tailwind CSS 4 配置（简化版）
+// Tailwind CSS 4 使用 CSS-first 方式，更多配置在 globals.css 中
 const config: Config = {
   darkMode: ['class'],
-  content: [
-    './src/**/*.{ts,tsx}',
-  ],
+  content: ['./src/**/*.{js,ts,jsx,tsx,mdx}'],
   theme: {
-    container: {
-      center: true,
-      padding: '2rem',
-      screens: {
-        '2xl': '1400px',
-      },
-    },
     extend: {
       colors: {
         border: 'hsl(var(--border))',
@@ -50,35 +41,16 @@ const config: Config = {
           DEFAULT: 'hsl(var(--card))',
           foreground: 'hsl(var(--card-foreground))',
         },
-        // B2 accent colors
         'accent-orange': '#F5A962',
         'accent-purple': '#C89BEC',
         'accent-blue': '#6BA3F5',
-        'success': '#5DCEA8',
-        'error': '#F07080',
+        success: '#5DCEA8',
+        error: '#F07080',
       },
-      borderRadius: {
-        lg: 'var(--radius)',
-        md: 'calc(var(--radius) - 2px)',
-        sm: 'calc(var(--radius) - 4px)',
-      },
-      keyframes: {
-        'accordion-down': {
-          from: { height: '0' },
-          to: { height: 'var(--radix-accordion-content-height)' },
-        },
-        'accordion-up': {
-          from: { height: 'var(--radix-accordion-content-height)' },
-          to: { height: '0' },
-        },
-      },
-      animation: {
-        'accordion-down': 'accordion-down 0.2s ease-out',
-        'accordion-up': 'accordion-up 0.2s ease-out',
-      },
+      borderRadius: 'lg',
     },
   },
-  plugins: [tailwindAnimate, typography],
+  plugins: [require('tailwindcss-animate')],
 }
 
 export default config
