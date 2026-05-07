@@ -1,21 +1,23 @@
 name: aigc-platform
 
 services:
-  postgres:
-    image: postgres:15-alpine
+  mysql:
+    image: mysql:8.0
     environment:
-      POSTGRES_USER: aigc
-      POSTGRES_PASSWORD: aigcpass
-      POSTGRES_DB: aigc_dev
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: aigc
+      MYSQL_USER: aigc
+      MYSQL_PASSWORD: aigcpassword
     ports:
-      - "5432:5432"
+      - "3306:3306"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U aigc"]
-      interval: 5s
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 10s
       timeout: 5s
       retries: 5
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
 
   redis:
     image: redis:7-alpine
@@ -47,6 +49,6 @@ services:
       retries: 3
 
 volumes:
-  postgres_data:
+  mysql_data:
   redis_data:
   minio_data:
