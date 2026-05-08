@@ -5,7 +5,12 @@ import { Textarea } from '@/components/ui/textarea'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Label } from '@/components/ui/label'
-import { randomUUID } from 'crypto' 
+/** 浏览器兼容的 UUID 生成，优先用 Web Crypto API，降级用随机数 */
+const randomUUID = (): string =>
+  typeof globalThis.crypto?.randomUUID === 'function'
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+    
 import {
   Dialog,
   DialogContent,
