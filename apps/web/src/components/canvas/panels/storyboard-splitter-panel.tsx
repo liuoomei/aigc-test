@@ -7,6 +7,7 @@ import { useCanvasStructureStore } from '@/stores/canvas/structure-store'
 import { useCanvasExecutionStore } from '@/stores/canvas/execution-store'
 import { useAuthStore } from '@/stores/auth-store'
 import { CanvasApiError, executeStoryboardSplitterNode } from '@/lib/canvas/canvas-api'
+import { randomUUID } from '@/lib/utils'
 import type { StoryboardSplitterConfig, AppNode, AppEdge } from '@/lib/canvas/types'
 import { isScriptWriterConfig, isTextInputConfig } from '@/lib/canvas/types'
 
@@ -88,7 +89,7 @@ export function StoryboardSplitterPanel({ nodeId, canvasId, config, onExecuted, 
         token ?? undefined,
       )
       addNodeOutput(nodeId, {
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         url: '',
         type: 'text',
         paramsSnapshot: { shots: result.shots },

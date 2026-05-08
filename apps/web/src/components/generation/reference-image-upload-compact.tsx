@@ -4,7 +4,7 @@ import { useRef, useCallback, useState } from 'react'
 import Image from 'next/image'
 import { useGenerationStore } from '@/stores/generation-store'
 import { ImagePlus, Trash2, X, Maximize2 } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, randomUUID } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { ImageLightbox } from '@/components/ui/image-lightbox'
 import { toast } from 'sonner'
@@ -47,7 +47,7 @@ export function ReferenceImageUploadCompact({ expanded = false }: ReferenceImage
 
       const previewUrl = URL.createObjectURL(file)
       addReferenceImage({
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         file,
         previewUrl,
       })

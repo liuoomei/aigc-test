@@ -15,6 +15,7 @@ import { StepComplete } from '@/components/video-studio/step-complete'
 import { useWizardState, WIZARD_STEP_DEFS } from '@/hooks/video-studio/use-wizard-state'
 import { useAuthStore } from '@/stores/auth-store'
 import { fetchWithAuth } from '@/lib/api-client'
+import { randomUUID } from '@/lib/utils'
 import { toast } from 'sonner'
 import { createSeriesEpisodes } from '@/lib/video-studio-api'
 import type { WizardState, EpisodeState } from '@/hooks/video-studio/use-wizard-state'
@@ -49,7 +50,7 @@ function WizardContent() {
   const [projectId] = useState(() => {
     const existing = searchParams.get('id')
     if (existing) return existing
-    return crypto.randomUUID()
+    return randomUUID()
   })
 
   useEffect(() => {

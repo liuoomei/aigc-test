@@ -5,12 +5,6 @@ import { Textarea } from '@/components/ui/textarea'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Label } from '@/components/ui/label'
-/** 浏览器兼容的 UUID 生成，优先用 Web Crypto API，降级用随机数 */
-const randomUUID = (): string =>
-  typeof globalThis.crypto?.randomUUID === 'function'
-    ? globalThis.crypto.randomUUID()
-    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
-    
 import {
   Dialog,
   DialogContent,
@@ -30,7 +24,7 @@ import { ApiError, fetchWithAuth, getRequestErrorMessage, reportClientSubmission
 import { ReferenceImageUploadCompact } from './reference-image-upload-compact'
 import { CompanyAImagePicker } from './company-a-image-picker'
 import { ImageLightbox } from '@/components/ui/image-lightbox'
-import { cn } from '@/lib/utils'
+import { cn, randomUUID } from '@/lib/utils'
 import Image from 'next/image'
 import { IMAGE_MODEL_CREDITS, VIDEO_PER_SECOND_CREDITS, VIDEO_FLAT_CREDITS } from '@/lib/credits'
 

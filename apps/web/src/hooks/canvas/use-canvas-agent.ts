@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { toast } from 'sonner'
+import { randomUUID } from '@/lib/utils'
 import { useCanvasStructureStore } from '@/stores/canvas/structure-store'
 import { useCanvasExecutionStore } from '@/stores/canvas/execution-store'
 import { useAuthStore } from '@/stores/auth-store'
@@ -300,7 +301,7 @@ async function executeNode(
         token ?? undefined,
       )
       execStore.addNodeOutput(nodeId, {
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         url: '',
         type: 'text',
         paramsSnapshot: { script: result.script, characters: result.characters, scenes: result.scenes },
@@ -328,7 +329,7 @@ async function executeNode(
         token ?? undefined,
       )
       execStore.addNodeOutput(nodeId, {
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         url: '',
         type: 'text',
         paramsSnapshot: { shots: result.shots },
@@ -392,14 +393,14 @@ export function useCanvasAgent(canvasId: string, kickPoll: () => void) {
       abortRef.current = new AbortController()
 
       const userMsg: AgentMessage = {
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         role: 'user',
         content: rawText,
         implicitNodeId: implicitNodeId ?? undefined,
         status: 'done',
       }
 
-      const assistantMsgId = crypto.randomUUID()
+      const assistantMsgId = randomUUID()
       const assistantMsg: AgentMessage = {
         id: assistantMsgId,
         role: 'assistant',
@@ -552,7 +553,7 @@ export function useCanvasAgent(canvasId: string, kickPoll: () => void) {
             if (outputs.length > 0) {
               setMessages((prev) => [
                 ...prev,
-                { id: crypto.randomUUID(), role: 'result' as const, nodeId, nodeLabel: node.data.label, outputs },
+                { id: randomUUID(), role: 'result' as const, nodeId, nodeLabel: node.data.label, outputs },
               ])
             }
           }

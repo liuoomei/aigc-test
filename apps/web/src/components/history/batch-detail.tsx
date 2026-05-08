@@ -17,6 +17,7 @@ import { downloadImage } from '@/lib/download'
 import { translateTaskError } from '@/lib/error-messages'
 import { useGenerationStore } from '@/stores/generation-store'
 import { toast } from 'sonner'
+import { randomUUID } from '@/lib/utils'
 
 interface BatchDetailProps {
   batchId: string | null
@@ -109,7 +110,7 @@ function BatchDetailContent({ batch, onClose, onApplied }: { batch: BatchRespons
     setSendingUrl(url)
     try {
       addReferenceImage({
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         previewUrl: url,
       })
       if (showSuccess) toast.success('已发送至参考区')
@@ -131,7 +132,7 @@ function BatchDetailContent({ batch, onClose, onApplied }: { batch: BatchRespons
       const availableSlots = 10 - referenceCount
       completedUrls.slice(0, availableSlots).forEach((url) => {
         addReferenceImage({
-          id: crypto.randomUUID(),
+          id: randomUUID(),
           previewUrl: url,
         })
       })

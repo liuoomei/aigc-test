@@ -22,6 +22,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import { uploadAssetFile } from '@/lib/canvas/canvas-api'
 import { useCanvasSidebarDataStore } from '@/stores/canvas/sidebar-data-store'
 import { toast } from 'sonner'
+import { randomUUID } from '@/lib/utils'
 import { NodeParamPanel } from './node-param-panel'
 import type { AppNode, AppEdge } from '@/lib/canvas/types'
 import { getUpstreamNodeIds } from '@/lib/canvas/dag'
@@ -249,7 +250,7 @@ function Flow({
           x: mousePosRef.current.x - rect.left,
           y: mousePosRef.current.y - rect.top,
         })
-        const newId = `node_${crypto.randomUUID()}`
+        const newId = `node_${randomUUID()}`
         addNodeWithConfig(
           copiedNodeRef.current.type!,
           { x: pos.x + 20, y: pos.y + 20 },
@@ -324,7 +325,7 @@ function Flow({
         })
         try {
           const url = await uploadAssetFile(file, token)
-          const nodeId = `node_${crypto.randomUUID()}`
+          const nodeId = `node_${randomUUID()}`
           addNodeWithConfig('asset', position, {
             url,
             name: file.name,
