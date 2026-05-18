@@ -5,7 +5,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { useAuthStore } from '@/stores/auth-store'
 import { loadAiChatHistory, saveAiChatHistory, clearAiChatHistory } from '@/hooks/use-ai-chat-history'
 import type { AiChatMessage } from '@/hooks/use-ai-chat-history'
-import { cn } from '@/lib/utils'
+import { cn, randomUUID } from '@/lib/utils'
 import { fetchWithAuth } from '@/lib/fetch-with-auth'
 import {
   Bot, X, Send, ImageIcon, Video, Trash2, Loader2, Upload, MessageSquare, GripVertical, Copy, Check,
@@ -322,7 +322,7 @@ export function AiAssistant() {
     const { message = '', tab: sendTab, image_base64, image_type, video_temp_id, userLabel, imagePreview, mediaLabel } = opts
 
     const userMsg: AiChatMessage = {
-      id: crypto.randomUUID(),
+      id: randomUUID(),
       role: 'user',
       content: userLabel ?? message,
       imagePreview,
@@ -331,7 +331,7 @@ export function AiAssistant() {
     }
 
     const assistantMsg: AiChatMessage = {
-      id: crypto.randomUUID(),
+      id: randomUUID(),
       role: 'assistant',
       content: '',
       timestamp: Date.now(),

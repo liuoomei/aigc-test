@@ -16,8 +16,12 @@ const execFileAsync = promisify(execFile)
 const pino = pino_ as any
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
-const EXTERNAL_STORAGE_URL = process.env.EXTERNAL_STORAGE_URL as string
-if (!EXTERNAL_STORAGE_URL) throw new Error('EXTERNAL_STORAGE_URL env var is required')
+// 懒加载：避免模块顶层在 dotenv 初始化前执行导致读不到环境变量
+function getExternalStorageUrl(): string {
+  const url = process.env.EXTERNAL_STORAGE_URL
+  if (!url) throw new Error('EXTERNAL_STORAGE_URL env var is required')
+  return url
+}
 
 // If the storage API returns an external domain URL, rewrite to internal base URL
 // so the API server can proxy it. e.g. https://midscreen.js118114.com:8443/path → http://61.155.227.29:19092/path
@@ -47,7 +51,7 @@ interface ExternalStorageResponse {
 
 async function uploadToExternalStorage(taskId: string, sourceUrl: string, assetType: 'image' | 'video' = 'image'): Promise<string> {
   const fileType = assetType === 'video' ? 'mp4' : 'jpg'
-  const res = await fetch(EXTERNAL_STORAGE_URL, {
+  const res = await fetch(getExternalStorageUrl(), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ uuid: taskId, url: sourceUrl, type: fileType }),
@@ -76,7 +80,7 @@ async function uploadBufferToExternalStorage(taskId: string, buffer: Buffer): Pr
 
   try {
     const publicUrl = `${baseUrl}/api/v1/canvases/uploads/${fileId}`
-    const res = await fetch(EXTERNAL_STORAGE_URL, {
+    const res = await fetch(getExternalStorageUrl(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ uuid: `${taskId}-thumb`, url: publicUrl, type: 'jpg' }),

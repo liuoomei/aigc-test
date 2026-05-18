@@ -4,7 +4,7 @@ import { useRef, useCallback } from 'react'
 import Image from 'next/image'
 import { useGenerationStore } from '@/stores/generation-store'
 import { ImagePlus, X } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, randomUUID } from '@/lib/utils'
 import { toast } from 'sonner'
 
 const MAX_IMAGES = 5
@@ -38,7 +38,7 @@ export function ReferenceImageUpload() {
 
       const previewUrl = URL.createObjectURL(file)
       addReferenceImage({
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         file,
         previewUrl,
       })

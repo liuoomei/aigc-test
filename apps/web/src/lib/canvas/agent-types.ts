@@ -1,4 +1,5 @@
 import type { AppNode, AppEdge, ImageModelType, ImageResolution } from '@/lib/canvas/types'
+import { randomUUID } from '@/lib/utils'
 
 // ── Instruction union ────────────────────────────────────────────────────────
 
@@ -148,7 +149,7 @@ function fillInstructionDefaults(raw: any): AgentInstruction | null {
         estimatedCredits: raw.estimatedCredits ?? 0,
         estimatedMinutes: raw.estimatedMinutes ?? 0,
         items: (raw.items ?? []).map((item: any) => ({
-          id: item.id ?? crypto.randomUUID(),
+          id: item.id ?? randomUUID(),
           label: item.label ?? '',
           description: item.description ?? '',
           selected: item.selected ?? true,
@@ -160,7 +161,7 @@ function fillInstructionDefaults(raw: any): AgentInstruction | null {
       return {
         type: 'confirm_storyboard',
         items: (raw.items ?? []).map((item: any) => ({
-          id: item.id ?? crypto.randomUUID(),
+          id: item.id ?? randomUUID(),
           label: item.label ?? '',
           content: item.content ?? '',
         })),

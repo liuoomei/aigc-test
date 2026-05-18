@@ -1,4 +1,5 @@
 import type { CanvasNodeDefinition, CanvasNodeData, AppNode, CanvasNodeType } from './types'
+import { randomUUID } from '@/lib/utils'
 import { TextNode } from '@/components/canvas/nodes/text-node'
 import { ImageGenNode } from '@/components/canvas/nodes/image-gen-node'
 import { AssetNode } from '@/components/canvas/nodes/asset-node'
@@ -110,7 +111,7 @@ export class NodeRegistry {
     const definition = this.getDefinition(type)
     if (!definition) throw new Error(`[NodeRegistry] 未知的节点类型: '${type}'，请先注册。`)
     return {
-      id: id || `node_${crypto.randomUUID()}`,
+      id: id || `node_${randomUUID()}`,
       type: definition.type,
       position,
       data: {

@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify'
+import { randomUUID } from 'crypto'
 import { getDb } from '@aigc/db'
 import { sql } from 'kysely'
 import { signAssetUrl } from '../lib/storage.js'
@@ -557,7 +558,7 @@ export async function videoStudioRoutes(app: FastifyInstance) {
 
       const rows = [] as Array<{ id: string; name: string; episode_index: number; wizard_state: unknown }>
       for (const [index, episode] of outline.episodes.entries()) {
-        const episodeId = crypto.randomUUID()
+        const episodeId = randomUUID()
         // Episode description: only this episode's story + minimal context (no full worldbuilding/character list)
         const episodeDescription = [
           `本集标题：${episode.title}`,

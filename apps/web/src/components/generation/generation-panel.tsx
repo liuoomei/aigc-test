@@ -24,7 +24,7 @@ import { ApiError, fetchWithAuth, getRequestErrorMessage, reportClientSubmission
 import { ReferenceImageUploadCompact } from './reference-image-upload-compact'
 import { CompanyAImagePicker } from './company-a-image-picker'
 import { ImageLightbox } from '@/components/ui/image-lightbox'
-import { cn } from '@/lib/utils'
+import { cn, randomUUID } from '@/lib/utils'
 import Image from 'next/image'
 import { IMAGE_MODEL_CREDITS, VIDEO_PER_SECOND_CREDITS, VIDEO_FLAT_CREDITS } from '@/lib/credits'
 
@@ -441,7 +441,7 @@ export function GenerationPanel({ onBatchCreated, disabled, initialMode = 'image
 
       const previewUrl = URL.createObjectURL(file)
       addReferenceImage({
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         file,
         previewUrl,
       })
@@ -488,7 +488,7 @@ export function GenerationPanel({ onBatchCreated, disabled, initialMode = 'image
       return
     }
     addReferenceImage({
-      id: crypto.randomUUID(),
+      id: randomUUID(),
       previewUrl: url,
     })
     toast.success('已添加参考图，提交时会自动加载原图')
@@ -674,7 +674,7 @@ export function GenerationPanel({ onBatchCreated, disabled, initialMode = 'image
     return new Promise((resolve) => {
       const reader = new FileReader()
       reader.onload = () => resolve({
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         previewUrl: URL.createObjectURL(file),
         dataUrl: reader.result as string,
         file,
@@ -733,7 +733,7 @@ export function GenerationPanel({ onBatchCreated, disabled, initialMode = 'image
           return
         }
         setVideoReferenceImages(prev => prev.length < 3 ? [...prev, {
-          id: crypto.randomUUID(),
+          id: randomUUID(),
           previewUrl: asset.url,
           dataUrl: asset.url,
         }] : prev)
@@ -764,10 +764,10 @@ export function GenerationPanel({ onBatchCreated, disabled, initialMode = 'image
     const looksLikeAssetImage = asset.type === 'image' || !asset.type
     if (looksLikeAssetImage) {
       if (!firstFrame) {
-        setFirstFrame({ id: crypto.randomUUID(), previewUrl: asset.url, dataUrl: asset.url })
+        setFirstFrame({ id: randomUUID(), previewUrl: asset.url, dataUrl: asset.url })
         return
       }
-      setLastFrame({ id: crypto.randomUUID(), previewUrl: asset.url, dataUrl: asset.url })
+      setLastFrame({ id: randomUUID(), previewUrl: asset.url, dataUrl: asset.url })
       return
     }
     try {
@@ -971,7 +971,7 @@ export function GenerationPanel({ onBatchCreated, disabled, initialMode = 'image
           }
         }
 
-        return [...prev, { id: crypto.randomUUID(), file: f, previewUrl, name: f.name, duration: newDuration }]
+        return [...prev, { id: randomUUID(), file: f, previewUrl, name: f.name, duration: newDuration }]
       })
     }
   }, [])
@@ -992,7 +992,7 @@ export function GenerationPanel({ onBatchCreated, disabled, initialMode = 'image
         return
       }
       setMultimodalAudios(prev => prev.length < 3 ? [...prev, {
-        id: crypto.randomUUID(), file: f, previewUrl: url, name: f.name, duration: audio.duration,
+        id: randomUUID(), file: f, previewUrl: url, name: f.name, duration: audio.duration,
       }] : prev)
     }
   }, [])
@@ -1042,7 +1042,7 @@ export function GenerationPanel({ onBatchCreated, disabled, initialMode = 'image
           return
         }
         setMultimodalImages(prev => prev.length < MAX_MULTIMODAL_IMAGES ? [...prev, {
-          id: crypto.randomUUID(),
+          id: randomUUID(),
           previewUrl: asset.url,
           dataUrl: asset.url,
         }] : prev)
@@ -2277,7 +2277,7 @@ export function GenerationPanel({ onBatchCreated, disabled, initialMode = 'image
                   URL.revokeObjectURL(url)
                   if (dur > 60) { toast.error('驱动音频时长不能超过 60 秒'); return }
                   const reader = new FileReader()
-                  reader.onload = () => setAvatarAudio({ id: crypto.randomUUID(), name: f.name, dataUrl: reader.result as string, duration: dur })
+                  reader.onload = () => setAvatarAudio({ id: randomUUID(), name: f.name, dataUrl: reader.result as string, duration: dur })
                   reader.readAsDataURL(f)
                 }
                 e.target.value = ''

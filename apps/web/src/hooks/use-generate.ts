@@ -2,6 +2,7 @@
 
 import { useCallback } from 'react'
 import { apiPost, ApiError, reportClientSubmissionError } from '@/lib/api-client'
+import { randomUUID } from '@/lib/utils'
 import { useGenerationStore } from '@/stores/generation-store'
 import { useAuthStore } from '@/stores/auth-store'
 import type { BatchResponse, GenerateImageRequest } from '@aigc/types'
@@ -82,7 +83,7 @@ export function useGenerate() {
       }
 
       const body: GenerateImageRequest = {
-        idempotency_key: crypto.randomUUID(),
+        idempotency_key: randomUUID(),
         model,
         prompt: prompt.trim(),
         quantity,

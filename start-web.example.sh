@@ -10,4 +10,5 @@ set -a
 source "$DIR/.env"
 set +a
 
-pnpm --filter @aigc/web start
+pnpm --filter @aigc/web dev
+# pnpm --filter @aigc/web start

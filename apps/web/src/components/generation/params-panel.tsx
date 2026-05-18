@@ -5,7 +5,7 @@ import Image from 'next/image'
 import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
 import { useGenerationStore } from '@/stores/generation-store'
-import { cn } from '@/lib/utils'
+import { cn, randomUUID } from '@/lib/utils'
 import { ImagePlus, X } from 'lucide-react'
 
 const aspectRatios = [
@@ -31,7 +31,7 @@ export function ParamsPanel() {
       if (file.size > MAX_SIZE_MB * 1024 * 1024) continue
 
       addReferenceImage({
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         file,
         previewUrl: URL.createObjectURL(file),
       })
